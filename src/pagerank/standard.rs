@@ -83,8 +83,7 @@ impl StandardPageRank {
             new_scores.fill(teleport + dangling_contribution);
 
             // Propagate scores through edges
-            for node in 0..n {
-                let node_score = scores[node];
+            for (node, &node_score) in scores.iter().enumerate() {
                 let total_weight = graph.node_total_weight(node as u32);
 
                 if total_weight > 0.0 {
@@ -149,8 +148,7 @@ impl StandardPageRank {
 
             new_scores.fill(teleport + dangling_contribution);
 
-            for node in 0..n {
-                let node_score = scores[node];
+            for (node, &node_score) in scores.iter().enumerate() {
                 let degree = graph.degree(node as u32);
 
                 if degree > 0 {

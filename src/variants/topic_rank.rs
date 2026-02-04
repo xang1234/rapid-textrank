@@ -411,12 +411,9 @@ mod tests {
         // (this verifies the graph has meaningful edges)
         if phrases.len() > 1 {
             let first_score = phrases[0].score;
-            let has_different_score = phrases
+            let _has_different_score = phrases
                 .iter()
                 .any(|p| (p.score - first_score).abs() > 1e-10);
-            // Note: With a small graph, scores might still be similar
-            // The key test is that the graph builds without panicking and produces results
-            assert!(phrases.len() >= 1, "Should produce meaningful rankings");
         }
     }
 

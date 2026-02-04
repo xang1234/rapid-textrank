@@ -239,8 +239,8 @@ mod tests {
             .map(|p| p.rank);
 
         // "machine" should rank higher when it's the focus
-        if machine_rank_1.is_some() && machine_rank_2.is_some() {
-            assert!(machine_rank_1.unwrap() <= machine_rank_2.unwrap());
+        if let (Some(rank_1), Some(rank_2)) = (machine_rank_1, machine_rank_2) {
+            assert!(rank_1 <= rank_2);
         }
     }
 

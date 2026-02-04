@@ -13,12 +13,19 @@ jobs:
   rust-test:
     name: Rust Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      PYO3_PYTHON: python
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Set up Rust
         run: |
@@ -103,8 +110,15 @@ jobs:
   benchmark:
     name: Benchmarks
     runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: python
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Set up Rust
         run: rustup default stable

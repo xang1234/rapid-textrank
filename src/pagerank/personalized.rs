@@ -111,8 +111,7 @@ impl PersonalizedPageRank {
             }
 
             // Propagate scores through edges
-            for node in 0..n {
-                let node_score = scores[node];
+            for (node, &node_score) in scores.iter().enumerate() {
                 let total_weight = graph.node_total_weight(node as u32);
 
                 if total_weight > 0.0 {

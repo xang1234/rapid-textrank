@@ -244,7 +244,7 @@ mod tests {
 
         for chunk in &chunks {
             let len = chunk.end_token - chunk.start_token;
-            assert!(len >= 2 && len <= 3);
+            assert!((2..=3).contains(&len));
         }
     }
 

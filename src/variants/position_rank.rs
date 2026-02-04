@@ -209,8 +209,8 @@ mod tests {
         let late_rank = phrases.iter().find(|p| p.lemma == "late").map(|p| p.rank);
 
         // If both exist, early should rank higher (lower rank number)
-        if early_rank.is_some() && late_rank.is_some() {
-            assert!(early_rank.unwrap() < late_rank.unwrap());
+        if let (Some(early), Some(late)) = (early_rank, late_rank) {
+            assert!(early < late);
         }
     }
 }

@@ -9,6 +9,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+type EdgeWeights = FxHashMap<(Arc<str>, Arc<str>), f64>;
+
 /// A node in the graph builder
 #[derive(Debug, Clone)]
 pub struct BuilderNode {
@@ -160,8 +162,9 @@ impl GraphBuilder {
                 let node_j = builder.get_or_create_node(&candidates[j].lemma);
 
                 // Window extends forward
-                for k in (j + 1)..std::cmp::min(j + window_size, sent_end) {
-                    let node_k = builder.get_or_create_node(&candidates[k].lemma);
+                let window_end = std::cmp::min(j + window_size, sent_end);
+                for candidate in candidates[(j + 1)..window_end].iter() {
+                    let node_k = builder.get_or_create_node(&candidate.lemma);
                     if use_weights {
                         // Weighted mode: accumulate co-occurrence counts
                         builder.increment_edge(node_j, node_k, 1.0);
@@ -311,7 +314,7 @@ pub fn build_graph_parallel_with_pos(
         .collect();
 
     // Build partial graphs in parallel using Arc<str> for cheap cloning
-    let partial_graphs: Vec<FxHashMap<(Arc<str>, Arc<str>), f64>> = sentences_with_arcs
+    let partial_graphs: Vec<EdgeWeights> = sentences_with_arcs
         .par_iter()
         .map(|sent_token_pairs| {
             let mut edges = FxHashMap::default();
