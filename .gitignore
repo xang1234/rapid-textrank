@@ -15,7 +15,10 @@ dist/
 build/
 .eggs/
 *.egg
+
+# Jupyter notebooks (but keep notebooks/ directory for examples)
 *.ipynb
+!notebooks/*.ipynb
 
 # Virtual environments
 .venv/
