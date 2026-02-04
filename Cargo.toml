@@ -1,16 +1,16 @@
 [package]
-name = "rust_textrank"
+name = "fast_textrank"
 version = "0.1.0"
 edition = "2021"
 authors = ["TextRanker Contributors"]
 description = "High-performance TextRank implementation with Python bindings"
 license = "MIT"
-repository = "https://github.com/textranker/rust_textrank"
+repository = "https://github.com/xang1234/fast-textrank"
 keywords = ["nlp", "textrank", "keyword-extraction", "summarization"]
 categories = ["text-processing", "science"]
 
 [lib]
-name = "rust_textrank"
+name = "fast_textrank"
 crate-type = ["cdylib", "rlib"]
 
 [features]
