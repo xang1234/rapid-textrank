@@ -241,7 +241,11 @@ impl AtomicCounter {
 ///
 /// This splits the document into chunks, builds partial graphs in parallel,
 /// and then merges them. Uses the default POS filter.
-pub fn build_graph_parallel(tokens: &[Token], window_size: usize, use_weights: bool) -> GraphBuilder {
+pub fn build_graph_parallel(
+    tokens: &[Token],
+    window_size: usize,
+    use_weights: bool,
+) -> GraphBuilder {
     build_graph_parallel_with_pos(tokens, window_size, use_weights, None)
 }
 
@@ -520,7 +524,11 @@ mod tests {
         let learning_id = builder.get_node_id("learning").unwrap();
 
         // With use_weights=true, edge weight should be > 1.0 due to accumulation
-        let weight = builder.get_node(machine_id).unwrap().edges.get(&learning_id);
+        let weight = builder
+            .get_node(machine_id)
+            .unwrap()
+            .edges
+            .get(&learning_id);
         assert!(weight.is_some());
         assert!(*weight.unwrap() > 1.0, "Expected accumulated weight > 1.0");
     }
@@ -541,7 +549,11 @@ mod tests {
         let learning_id = builder.get_node_id("learning").unwrap();
 
         // With use_weights=false, edge weight should be exactly 1.0 (binary)
-        let weight = builder.get_node(machine_id).unwrap().edges.get(&learning_id);
+        let weight = builder
+            .get_node(machine_id)
+            .unwrap()
+            .edges
+            .get(&learning_id);
         assert!(weight.is_some());
         assert_eq!(*weight.unwrap(), 1.0, "Expected binary weight = 1.0");
     }
@@ -583,19 +595,26 @@ mod tests {
         ];
 
         // Only include Nouns - should only have "machine"
-        let builder_nouns = GraphBuilder::from_tokens_with_pos(&tokens, 3, true, Some(&[PosTag::Noun]));
+        let builder_nouns =
+            GraphBuilder::from_tokens_with_pos(&tokens, 3, true, Some(&[PosTag::Noun]));
         assert_eq!(builder_nouns.node_count(), 1);
         assert!(builder_nouns.get_node_id("machine").is_some());
         assert!(builder_nouns.get_node_id("run").is_none());
 
         // Only include Verbs - should only have "run"
-        let builder_verbs = GraphBuilder::from_tokens_with_pos(&tokens, 3, true, Some(&[PosTag::Verb]));
+        let builder_verbs =
+            GraphBuilder::from_tokens_with_pos(&tokens, 3, true, Some(&[PosTag::Verb]));
         assert_eq!(builder_verbs.node_count(), 1);
         assert!(builder_verbs.get_node_id("run").is_some());
         assert!(builder_verbs.get_node_id("machine").is_none());
 
         // Include Nouns and Verbs - should have both
-        let builder_both = GraphBuilder::from_tokens_with_pos(&tokens, 3, true, Some(&[PosTag::Noun, PosTag::Verb]));
+        let builder_both = GraphBuilder::from_tokens_with_pos(
+            &tokens,
+            3,
+            true,
+            Some(&[PosTag::Noun, PosTag::Verb]),
+        );
         assert_eq!(builder_both.node_count(), 2);
         assert!(builder_both.get_node_id("machine").is_some());
         assert!(builder_both.get_node_id("run").is_some());
@@ -652,7 +671,11 @@ mod tests {
         let machine_id = builder.get_node_id("machine").unwrap();
         let learning_id = builder.get_node_id("learning").unwrap();
 
-        let weight = builder.get_node(machine_id).unwrap().edges.get(&learning_id);
+        let weight = builder
+            .get_node(machine_id)
+            .unwrap()
+            .edges
+            .get(&learning_id);
         assert!(weight.is_some());
         assert_eq!(
             *weight.unwrap(),
@@ -705,7 +728,11 @@ mod tests {
         let machine_id = builder.get_node_id("machine").unwrap();
         let learning_id = builder.get_node_id("learning").unwrap();
 
-        let weight = builder.get_node(machine_id).unwrap().edges.get(&learning_id);
+        let weight = builder
+            .get_node(machine_id)
+            .unwrap()
+            .edges
+            .get(&learning_id);
         assert!(weight.is_some());
         assert_eq!(
             *weight.unwrap(),

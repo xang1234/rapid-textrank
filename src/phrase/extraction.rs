@@ -118,10 +118,7 @@ impl PhraseExtractor {
         let mut groups: FxHashMap<String, Vec<ScoredChunk>> = FxHashMap::default();
 
         for chunk in chunks {
-            groups
-                .entry(chunk.lemma.clone())
-                .or_default()
-                .push(chunk);
+            groups.entry(chunk.lemma.clone()).or_default().push(chunk);
         }
 
         // Create phrases with canonical forms
@@ -260,7 +257,9 @@ mod tests {
         assert!(!phrases.is_empty());
         // Should find "machine learning", "artificial intelligence", etc.
         let texts: Vec<_> = phrases.iter().map(|p| p.text.to_lowercase()).collect();
-        assert!(texts.iter().any(|t| t.contains("machine") || t.contains("learning")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("machine") || t.contains("learning")));
     }
 
     #[test]

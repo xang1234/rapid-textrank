@@ -72,8 +72,7 @@ impl PositionRank {
         let first_positions = self.get_first_positions(tokens, &graph);
 
         // Build personalization vector
-        let personalization =
-            position_based_personalization(&first_positions, graph.num_nodes);
+        let personalization = position_based_personalization(&first_positions, graph.num_nodes);
 
         // Run personalized PageRank
         let pagerank = PersonalizedPageRank::new()

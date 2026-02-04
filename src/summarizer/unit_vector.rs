@@ -79,11 +79,7 @@ impl UnitVectorBuilder {
     }
 
     /// Build a unit vector for a sentence
-    pub fn build_sentence_vector(
-        &self,
-        sentence: &Sentence,
-        tokens: &[Token],
-    ) -> UnitVector {
+    pub fn build_sentence_vector(&self, sentence: &Sentence, tokens: &[Token]) -> UnitVector {
         let mut dimensions: FxHashMap<String, f64> = FxHashMap::default();
 
         // Get tokens in this sentence

@@ -43,8 +43,7 @@ impl StopwordFilter {
 
     /// Create a stopword filter from a custom list
     pub fn from_list(words: &[&str]) -> Self {
-        let stopwords: FxHashSet<String> =
-            words.iter().map(|w| w.to_lowercase()).collect();
+        let stopwords: FxHashSet<String> = words.iter().map(|w| w.to_lowercase()).collect();
         Self {
             stopwords,
             case_sensitive: false,
@@ -124,10 +123,7 @@ impl StopwordFilter {
             }
         };
 
-        get(lang)
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        get(lang).iter().map(|s| s.to_string()).collect()
     }
 
     /// Common Chinese stopwords
@@ -145,10 +141,50 @@ impl StopwordFilter {
     /// Common Japanese stopwords
     fn japanese_stopwords() -> FxHashSet<String> {
         [
-            "の", "に", "は", "を", "た", "が", "で", "て", "と", "し", "れ", "さ", "ある",
-            "いる", "も", "する", "から", "な", "こと", "として", "い", "や", "など", "なっ",
-            "ない", "この", "ため", "その", "あっ", "よう", "また", "もの", "という", "あり",
-            "まで", "られ", "なる", "へ", "か", "だ", "これ", "によって", "により", "おり",
+            "の",
+            "に",
+            "は",
+            "を",
+            "た",
+            "が",
+            "で",
+            "て",
+            "と",
+            "し",
+            "れ",
+            "さ",
+            "ある",
+            "いる",
+            "も",
+            "する",
+            "から",
+            "な",
+            "こと",
+            "として",
+            "い",
+            "や",
+            "など",
+            "なっ",
+            "ない",
+            "この",
+            "ため",
+            "その",
+            "あっ",
+            "よう",
+            "また",
+            "もの",
+            "という",
+            "あり",
+            "まで",
+            "られ",
+            "なる",
+            "へ",
+            "か",
+            "だ",
+            "これ",
+            "によって",
+            "により",
+            "おり",
         ]
         .iter()
         .map(|s| s.to_string())

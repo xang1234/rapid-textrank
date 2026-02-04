@@ -1,7 +1,7 @@
 //! Property-based tests using proptest
 
-use proptest::prelude::*;
 use fast_textrank::*;
+use proptest::prelude::*;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]

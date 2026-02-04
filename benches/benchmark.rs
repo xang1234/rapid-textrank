@@ -76,9 +76,7 @@ fn benchmark_pagerank(c: &mut Criterion) {
     let csr_graph = graph::csr::CsrGraph::from_builder(&builder);
 
     c.bench_function("pagerank", |b| {
-        b.iter(|| {
-            pagerank::standard::StandardPageRank::new().run(black_box(&csr_graph))
-        })
+        b.iter(|| pagerank::standard::StandardPageRank::new().run(black_box(&csr_graph)))
     });
 
     // Benchmark with different damping factors
@@ -123,7 +121,10 @@ fn benchmark_phrase_extraction(c: &mut Criterion) {
 
     group.bench_function("position_rank", |b| {
         b.iter(|| {
-            variants::position_rank::extract_keyphrases_position(black_box(&tokens), black_box(&config))
+            variants::position_rank::extract_keyphrases_position(
+                black_box(&tokens),
+                black_box(&config),
+            )
         })
     });
 
@@ -172,8 +173,21 @@ fn benchmark_stopwords(c: &mut Criterion) {
 
     // Words to check
     let words: Vec<&str> = vec![
-        "the", "and", "is", "a", "machine", "learning", "artificial", "intelligence",
-        "deep", "neural", "network", "data", "algorithm", "computer", "science",
+        "the",
+        "and",
+        "is",
+        "a",
+        "machine",
+        "learning",
+        "artificial",
+        "intelligence",
+        "deep",
+        "neural",
+        "network",
+        "data",
+        "algorithm",
+        "computer",
+        "science",
     ];
 
     c.bench_function("stopword_check", |b| {

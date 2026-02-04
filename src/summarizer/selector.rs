@@ -196,11 +196,16 @@ impl SentenceSelector {
             let mut count = 0;
             for i in 0..selected.len() {
                 for j in (i + 1)..selected.len() {
-                    total_sim += sent_vectors[selected[i]].cosine_similarity(&sent_vectors[selected[j]]);
+                    total_sim +=
+                        sent_vectors[selected[i]].cosine_similarity(&sent_vectors[selected[j]]);
                     count += 1;
                 }
             }
-            1.0 - (if count > 0 { total_sim / count as f64 } else { 0.0 })
+            1.0 - (if count > 0 {
+                total_sim / count as f64
+            } else {
+                0.0
+            })
         } else {
             1.0
         };

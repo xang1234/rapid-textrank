@@ -106,8 +106,8 @@ impl PersonalizedPageRank {
 
             // Initialize with teleport probability based on personalization
             for i in 0..n {
-                new_scores[i] =
-                    (1.0 - self.damping) * personalization[i] + self.damping * dangling_mass * personalization[i];
+                new_scores[i] = (1.0 - self.damping) * personalization[i]
+                    + self.damping * dangling_mass * personalization[i];
             }
 
             // Propagate scores through edges
@@ -184,7 +184,10 @@ impl PersonalizedPageRank {
 /// Create a position-based personalization vector
 ///
 /// Assigns weight 1/(position + 1) to each node's first occurrence.
-pub fn position_based_personalization(first_positions: &[(u32, usize)], num_nodes: usize) -> Vec<f64> {
+pub fn position_based_personalization(
+    first_positions: &[(u32, usize)],
+    num_nodes: usize,
+) -> Vec<f64> {
     let mut personalization = vec![0.0; num_nodes];
     for &(node, position) in first_positions {
         if (node as usize) < num_nodes {

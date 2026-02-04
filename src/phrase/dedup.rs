@@ -199,8 +199,8 @@ mod tests {
     fn test_resolve_overlaps_higher_score_replaces() {
         // Test that resolve_overlaps correctly replaces lower-score chunk with higher-score
         let chunks = vec![
-            make_chunk(0, 15, 1.0, "lower score"),      // First chunk
-            make_chunk(10, 25, 3.0, "higher score"),    // Overlaps, higher score
+            make_chunk(0, 15, 1.0, "lower score"),   // First chunk
+            make_chunk(10, 25, 3.0, "higher score"), // Overlaps, higher score
         ];
 
         let result = resolve_overlaps(chunks);
@@ -214,8 +214,8 @@ mod tests {
     fn test_resolve_overlaps_lower_score_ignored() {
         // Test that later chunk with lower score doesn't replace earlier chunk
         let chunks = vec![
-            make_chunk(0, 15, 3.0, "higher score"),     // First chunk, high score
-            make_chunk(10, 25, 1.0, "lower score"),     // Overlaps, lower score
+            make_chunk(0, 15, 3.0, "higher score"), // First chunk, high score
+            make_chunk(10, 25, 1.0, "lower score"), // Overlaps, lower score
         ];
 
         let result = resolve_overlaps(chunks);

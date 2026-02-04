@@ -33,7 +33,9 @@ pub use types::{
 // Re-export main functionality
 pub use graph::{builder::GraphBuilder, csr::CsrGraph};
 pub use nlp::{stopwords::StopwordFilter, tokenizer::Tokenizer};
-pub use pagerank::{personalized::PersonalizedPageRank, standard::StandardPageRank, PageRankResult};
+pub use pagerank::{
+    personalized::PersonalizedPageRank, standard::StandardPageRank, PageRankResult,
+};
 pub use phrase::extraction::PhraseExtractor;
 pub use summarizer::selector::SentenceSelector;
 pub use variants::{biased_textrank::BiasedTextRank, position_rank::PositionRank};

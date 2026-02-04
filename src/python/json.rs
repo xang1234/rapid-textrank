@@ -338,11 +338,28 @@ mod tests {
         );
 
         // Should have 2 nodes: "run" and "process" (the verbs)
-        assert_eq!(builder.node_count(), 2, "Expected 2 verb nodes, got {}", builder.node_count());
-        assert!(builder.get_node_id("run").is_some(), "Expected 'run' verb to be in graph");
-        assert!(builder.get_node_id("process").is_some(), "Expected 'process' verb to be in graph");
-        assert!(builder.get_node_id("machine").is_none(), "Noun 'machine' should not be in graph");
-        assert!(builder.get_node_id("computer").is_none(), "Noun 'computer' should not be in graph");
+        assert_eq!(
+            builder.node_count(),
+            2,
+            "Expected 2 verb nodes, got {}",
+            builder.node_count()
+        );
+        assert!(
+            builder.get_node_id("run").is_some(),
+            "Expected 'run' verb to be in graph"
+        );
+        assert!(
+            builder.get_node_id("process").is_some(),
+            "Expected 'process' verb to be in graph"
+        );
+        assert!(
+            builder.get_node_id("machine").is_none(),
+            "Noun 'machine' should not be in graph"
+        );
+        assert!(
+            builder.get_node_id("computer").is_none(),
+            "Noun 'computer' should not be in graph"
+        );
     }
 
     #[test]
@@ -361,8 +378,12 @@ mod tests {
         // Should have default POS tags
         assert_eq!(config.include_pos.len(), 3);
         assert!(config.include_pos.contains(&crate::types::PosTag::Noun));
-        assert!(config.include_pos.contains(&crate::types::PosTag::Adjective));
-        assert!(config.include_pos.contains(&crate::types::PosTag::ProperNoun));
+        assert!(config
+            .include_pos
+            .contains(&crate::types::PosTag::Adjective));
+        assert!(config
+            .include_pos
+            .contains(&crate::types::PosTag::ProperNoun));
     }
 
     #[test]
@@ -401,6 +422,9 @@ mod tests {
         assert_eq!(builder.node_count(), 2);
         assert!(builder.get_node_id("machine").is_some());
         assert!(builder.get_node_id("smart").is_some());
-        assert!(builder.get_node_id("learn").is_none(), "Verb 'learn' should not be in graph");
+        assert!(
+            builder.get_node_id("learn").is_none(),
+            "Verb 'learn' should not be in graph"
+        );
     }
 }

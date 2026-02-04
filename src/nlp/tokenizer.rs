@@ -116,7 +116,11 @@ impl Tokenizer {
         let lower = word.to_lowercase();
 
         // Check for common patterns
-        if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        if word
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
             && word.chars().skip(1).all(|c| c.is_lowercase())
         {
             // Capitalized word (might be proper noun or sentence start)
@@ -158,7 +162,10 @@ impl Tokenizer {
         }
 
         // Numbers
-        if word.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
+        if word
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        {
             return PosTag::Numeral;
         }
 

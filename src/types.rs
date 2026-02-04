@@ -423,9 +423,7 @@ impl TextRankConfig {
         }
 
         if self.max_iterations == 0 {
-            return Err(TextRankError::invalid_config(
-                "max_iterations must be > 0",
-            ));
+            return Err(TextRankError::invalid_config("max_iterations must be > 0"));
         }
 
         if self.convergence_threshold <= 0.0 {
@@ -435,9 +433,7 @@ impl TextRankConfig {
         }
 
         if self.window_size < 2 {
-            return Err(TextRankError::invalid_config(
-                "window_size must be >= 2",
-            ));
+            return Err(TextRankError::invalid_config("window_size must be >= 2"));
         }
 
         if self.min_phrase_length == 0 {
