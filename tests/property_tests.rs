@@ -199,10 +199,4 @@ mod rand {
         let hash = hasher.finish();
         T::from((hash % 1000) as f64 / 1000.0)
     }
-
-    pub struct ThreadRng;
-
-    pub fn thread_rng() -> ThreadRng {
-        ThreadRng
-    }
 }
