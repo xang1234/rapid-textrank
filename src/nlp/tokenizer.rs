@@ -185,15 +185,15 @@ impl Tokenizer {
                 PosTag::Determiner
             }
             // Conjunctions
-            "and" | "or" | "but" | "nor" | "so" | "yet" | "if" | "because" | "while"
-            | "though" | "although" | "when" | "unless" | "until" | "since" => PosTag::Conjunction,
+            "and" | "or" | "but" | "nor" | "so" | "yet" | "if" | "because" | "while" | "though"
+            | "although" | "when" | "unless" | "until" | "since" => PosTag::Conjunction,
             // Prepositions
             "of" | "to" | "in" | "for" | "on" | "with" | "at" | "from" | "by" | "about" | "as"
             | "into" | "like" | "through" | "after" | "over" | "between" | "out" | "against"
             | "during" | "without" | "before" | "under" | "around" | "among" => PosTag::Preposition,
             // Pronouns
-            "i" | "you" | "he" | "she" | "it" | "we" | "they" | "me" | "him" | "us"
-            | "them" | "myself" | "yourself" | "ourselves" | "themselves" => PosTag::Pronoun,
+            "i" | "you" | "he" | "she" | "it" | "we" | "they" | "me" | "him" | "us" | "them"
+            | "myself" | "yourself" | "ourselves" | "themselves" => PosTag::Pronoun,
             // Common particles
             "not" | "n't" => PosTag::Particle,
             _ => return None,
