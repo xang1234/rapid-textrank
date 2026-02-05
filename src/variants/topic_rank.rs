@@ -6,17 +6,17 @@
 //!
 //! Process:
 //! 1. Extract candidate phrases
-//! 2. Cluster similar phrases based on shared stems/lemmas
-//! 3. Build graph where nodes are clusters
+//! 2. Cluster candidates with HAC (average linkage) over Jaccard distance
+//! 3. Build a complete graph where nodes are clusters
 //! 4. Run PageRank on the cluster graph
-//! 5. Select best phrase from each top cluster
+//! 5. Select the first occurring phrase from each top cluster
 
 use crate::graph::builder::GraphBuilder;
 use crate::graph::csr::CsrGraph;
 use crate::pagerank::standard::StandardPageRank;
 use crate::phrase::chunker::{chunk_lemma, chunk_text, NounChunker};
 use crate::types::{Phrase, TextRankConfig, Token};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 /// TopicRank implementation
 #[derive(Debug)]
@@ -24,6 +24,8 @@ pub struct TopicRank {
     config: TextRankConfig,
     /// Jaccard similarity threshold for clustering
     similarity_threshold: f64,
+    /// Edge weight multiplier for topic graph edges
+    edge_weight: f64,
     /// Maximum number of phrases to cluster (for performance)
     max_phrases: usize,
 }
@@ -40,6 +42,7 @@ impl TopicRank {
         Self {
             config: TextRankConfig::default(),
             similarity_threshold: 0.25,
+            edge_weight: 1.0,
             max_phrases: 200,
         }
     }
@@ -49,6 +52,7 @@ impl TopicRank {
         Self {
             config,
             similarity_threshold: 0.25,
+            edge_weight: 1.0,
             max_phrases: 200,
         }
     }
@@ -59,10 +63,52 @@ impl TopicRank {
         self
     }
 
+    /// Set edge weight multiplier for topic graph edges
+    pub fn with_edge_weight(mut self, weight: f64) -> Self {
+        self.edge_weight = weight.max(0.0);
+        self
+    }
+
     /// Set maximum phrases to process
     pub fn with_max_phrases(mut self, max: usize) -> Self {
         self.max_phrases = max;
         self
+    }
+
+    fn is_kept_token(&self, token: &Token) -> bool {
+        if token.is_stopword {
+            return false;
+        }
+        if self.config.include_pos.is_empty() {
+            token.pos.is_content_word()
+        } else {
+            self.config.include_pos.contains(&token.pos)
+        }
+    }
+
+    fn trim_chunk_to_first_kept(
+        &self,
+        tokens: &[Token],
+        chunk: &crate::types::ChunkSpan,
+    ) -> Option<crate::types::ChunkSpan> {
+        let mut start = chunk.start_token;
+        let end = chunk.end_token;
+
+        while start < end && !self.is_kept_token(&tokens[start]) {
+            start += 1;
+        }
+
+        if start >= end {
+            return None;
+        }
+
+        Some(crate::types::ChunkSpan {
+            start_token: start,
+            end_token: end,
+            start_char: tokens[start].start,
+            end_char: tokens[end - 1].end,
+            sentence_idx: tokens[start].sentence_idx,
+        })
     }
 
     /// Extract keyphrases using TopicRank
@@ -78,26 +124,26 @@ impl TopicRank {
         }
 
         // Create phrase candidates
-        let mut candidates: Vec<PhraseCandidate> = chunks
-            .iter()
-            .take(self.max_phrases)
-            .map(|chunk| {
-                let text = chunk_text(tokens, chunk);
-                let lemma = chunk_lemma(tokens, chunk);
-                let stems: FxHashSet<String> =
-                    lemma.split_whitespace().map(|s| s.to_lowercase()).collect();
-                PhraseCandidate {
-                    text,
-                    lemma,
-                    stems,
-                    chunk: chunk.clone(),
-                }
-            })
-            .collect();
-
-        // Deduplicate by lemma
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        candidates.retain(|c| seen.insert(c.lemma.clone()));
+        let mut candidates: Vec<PhraseCandidate> = Vec::new();
+        for chunk in chunks.iter().take(self.max_phrases) {
+            let trimmed = match self.trim_chunk_to_first_kept(tokens, chunk) {
+                Some(span) => span,
+                None => continue,
+            };
+            let text = chunk_text(tokens, &trimmed);
+            let lemma = chunk_lemma(tokens, &trimmed);
+            let terms: FxHashSet<String> = tokens[trimmed.start_token..trimmed.end_token]
+                .iter()
+                .filter(|t| !t.is_stopword)
+                .map(|t| t.text.clone())
+                .collect();
+            candidates.push(PhraseCandidate {
+                text,
+                lemma,
+                terms,
+                chunk: trimmed,
+            });
+        }
 
         if candidates.is_empty() {
             return Vec::new();
@@ -111,8 +157,7 @@ impl TopicRank {
         }
 
         // Build cluster graph
-        let (cluster_graph, cluster_members) =
-            self.build_cluster_graph(tokens, &clusters, &candidates);
+        let (cluster_graph, cluster_members) = self.build_cluster_graph(&clusters, &candidates);
 
         // Run PageRank on cluster graph
         let pagerank = StandardPageRank::new()
@@ -140,76 +185,62 @@ impl TopicRank {
         phrases
     }
 
-    /// Cluster phrases based on stem overlap (Jaccard similarity)
+    /// Cluster phrases using HAC (average linkage) over Jaccard distance
     fn cluster_phrases(&self, candidates: &[PhraseCandidate]) -> Vec<Vec<usize>> {
         let n = candidates.len();
-        let mut parent: Vec<usize> = (0..n).collect();
-
-        // Union-find helpers
-        fn find(parent: &mut [usize], i: usize) -> usize {
-            if parent[i] != i {
-                parent[i] = find(parent, parent[i]);
-            }
-            parent[i]
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![vec![0]];
         }
 
-        fn union(parent: &mut [usize], i: usize, j: usize) {
-            let pi = find(parent, i);
-            let pj = find(parent, j);
-            if pi != pj {
-                parent[pi] = pj;
-            }
-        }
-
-        // Build inverted index: stem -> candidate indices
-        // This lets us skip pairs that share no stems (Jaccard would be 0)
-        let mut stem_to_candidates: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
-        for (i, candidate) in candidates.iter().enumerate() {
-            for stem in &candidate.stems {
-                stem_to_candidates.entry(stem.as_str()).or_default().push(i);
+        let mut base_dist = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dist = jaccard_distance(&candidates[i].terms, &candidates[j].terms);
+                base_dist[i][j] = dist;
+                base_dist[j][i] = dist;
             }
         }
 
-        // Only compare candidates that share at least one stem
-        let mut compared: FxHashSet<(usize, usize)> = FxHashSet::default();
-        for indices in stem_to_candidates.values() {
-            if indices.len() < 2 {
-                continue;
+        let cutoff = (0.99 - self.similarity_threshold).clamp(0.0, 1.0);
+        let mut clusters: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+
+        loop {
+            if clusters.len() <= 1 {
+                break;
             }
-            for idx_i in 0..indices.len() {
-                for idx_j in (idx_i + 1)..indices.len() {
-                    let i = indices[idx_i];
-                    let j = indices[idx_j];
-                    let pair = if i < j { (i, j) } else { (j, i) };
 
-                    // Skip if already compared
-                    if !compared.insert(pair) {
-                        continue;
-                    }
+            let mut best_i = 0;
+            let mut best_j = 0;
+            let mut best_dist = f64::INFINITY;
 
-                    let sim =
-                        jaccard_similarity(&candidates[pair.0].stems, &candidates[pair.1].stems);
-                    if sim >= self.similarity_threshold {
-                        union(&mut parent, pair.0, pair.1);
+            for i in 0..clusters.len() {
+                for j in (i + 1)..clusters.len() {
+                    let dist = average_linkage_distance(&base_dist, &clusters[i], &clusters[j]);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_i = i;
+                        best_j = j;
                     }
                 }
             }
+
+            if best_dist > cutoff {
+                break;
+            }
+
+            let mut merged = clusters.remove(best_j);
+            clusters[best_i].append(&mut merged);
         }
 
-        // Group by cluster
-        let mut clusters: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-        for i in 0..n {
-            let root = find(&mut parent, i);
-            clusters.entry(root).or_default().push(i);
-        }
-
-        clusters.into_values().collect()
+        clusters
     }
 
     /// Build a graph where nodes are clusters and edges connect co-occurring clusters
     fn build_cluster_graph(
         &self,
-        _tokens: &[Token],
         clusters: &[Vec<usize>],
         candidates: &[PhraseCandidate],
     ) -> (CsrGraph, Vec<Vec<usize>>) {
@@ -220,34 +251,22 @@ impl TopicRank {
             builder.get_or_create_node(&format!("cluster_{}", i));
         }
 
-        // Build mapping: phrase_index -> cluster_index
-        let mut phrase_to_cluster: FxHashMap<usize, usize> = FxHashMap::default();
-        for (cluster_idx, members) in clusters.iter().enumerate() {
-            for &phrase_idx in members {
-                phrase_to_cluster.insert(phrase_idx, cluster_idx);
-            }
-        }
-
-        // Build mapping: sentence_index -> set of cluster indices
-        let mut sentence_clusters: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
-        for (phrase_idx, candidate) in candidates.iter().enumerate() {
-            if let Some(&cluster_idx) = phrase_to_cluster.get(&phrase_idx) {
-                let sent_idx = candidate.chunk.sentence_idx;
-                sentence_clusters
-                    .entry(sent_idx)
-                    .or_default()
-                    .insert(cluster_idx);
-            }
-        }
-
-        // Connect clusters that co-occur in the same sentence
-        for cluster_indices in sentence_clusters.values() {
-            let list: Vec<usize> = cluster_indices.iter().copied().collect();
-            for i in 0..list.len() {
-                for j in (i + 1)..list.len() {
-                    let node_i = list[i] as u32;
-                    let node_j = list[j] as u32;
-                    builder.increment_edge(node_i, node_j, 1.0);
+        // Complete graph with inverse-distance weights
+        for i in 0..clusters.len() {
+            for j in (i + 1)..clusters.len() {
+                let mut weight = 0.0;
+                for &source_idx in &clusters[i] {
+                    for &target_idx in &clusters[j] {
+                        let source_start = candidates[source_idx].chunk.start_token as isize;
+                        let target_start = candidates[target_idx].chunk.start_token as isize;
+                        let distance = (source_start - target_start).abs() as usize;
+                        if distance > 0 {
+                            weight += 1.0 / distance as f64;
+                        }
+                    }
+                }
+                if weight > 0.0 {
+                    builder.increment_edge(i as u32, j as u32, weight * self.edge_weight);
                 }
             }
         }
@@ -270,22 +289,31 @@ impl TopicRank {
                 // Get cluster score from PageRank
                 let cluster_score = pagerank.score(cluster_idx as u32);
 
-                // Select representative: prefer shorter, more frequent phrases
-                // For simplicity, just take the first (which tends to be shorter)
+                // Select representative: first occurring candidate
                 let best_idx = members
                     .iter()
-                    .min_by_key(|&&idx| candidates[idx].text.len())
+                    .min_by_key(|&&idx| candidates[idx].chunk.start_token)
                     .copied()
                     .unwrap_or(members[0]);
 
                 let candidate = &candidates[best_idx];
+                let mut offsets: Vec<(usize, usize)> = members
+                    .iter()
+                    .map(|&idx| {
+                        (
+                            candidates[idx].chunk.start_token,
+                            candidates[idx].chunk.end_token,
+                        )
+                    })
+                    .collect();
+                offsets.sort_by_key(|(start, _)| *start);
 
                 Phrase {
                     text: candidate.text.clone(),
                     lemma: candidate.lemma.clone(),
                     score: cluster_score,
                     count: members.len(),
-                    offsets: vec![(candidate.chunk.start_token, candidate.chunk.end_token)],
+                    offsets,
                     rank: 0,
                 }
             })
@@ -298,21 +326,43 @@ impl TopicRank {
 struct PhraseCandidate {
     text: String,
     lemma: String,
-    stems: FxHashSet<String>,
+    terms: FxHashSet<String>,
     chunk: crate::types::ChunkSpan,
 }
 
-/// Jaccard similarity between two sets
-fn jaccard_similarity(a: &FxHashSet<String>, b: &FxHashSet<String>) -> f64 {
+/// Jaccard distance between two sets
+fn jaccard_distance(a: &FxHashSet<String>, b: &FxHashSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
-        return 1.0;
+        return 0.0;
     }
     let intersection = a.intersection(b).count();
     let union = a.union(b).count();
     if union == 0 {
+        1.0
+    } else {
+        1.0 - (intersection as f64 / union as f64)
+    }
+}
+
+fn average_linkage_distance(
+    base_dist: &[Vec<f64>],
+    cluster_a: &[usize],
+    cluster_b: &[usize],
+) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+
+    for &i in cluster_a {
+        for &j in cluster_b {
+            sum += base_dist[i][j];
+            count += 1;
+        }
+    }
+
+    if count == 0 {
         0.0
     } else {
-        intersection as f64 / union as f64
+        sum / count as f64
     }
 }
 
@@ -349,28 +399,29 @@ mod tests {
     }
 
     #[test]
-    fn test_jaccard_similarity() {
+    fn test_jaccard_distance() {
         let a: FxHashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let b: FxHashSet<String> = ["b", "c", "d"].iter().map(|s| s.to_string()).collect();
 
-        let sim = jaccard_similarity(&a, &b);
+        let dist = jaccard_distance(&a, &b);
         // Intersection: {b, c} = 2, Union: {a, b, c, d} = 4
-        assert!((sim - 0.5).abs() < 1e-6);
+        // Jaccard distance = 1 - (2/4) = 0.5
+        assert!((dist - 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn test_jaccard_identical() {
+    fn test_jaccard_distance_identical() {
         let a: FxHashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let sim = jaccard_similarity(&a, &a);
-        assert!((sim - 1.0).abs() < 1e-6);
+        let dist = jaccard_distance(&a, &a);
+        assert!((dist - 0.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_jaccard_disjoint() {
+    fn test_jaccard_distance_disjoint() {
         let a: FxHashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let b: FxHashSet<String> = ["c", "d"].iter().map(|s| s.to_string()).collect();
-        let sim = jaccard_similarity(&a, &b);
-        assert!((sim - 0.0).abs() < 1e-6);
+        let dist = jaccard_distance(&a, &b);
+        assert!((dist - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -383,58 +434,46 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_graph_has_edges() {
-        // Create tokens that will form multiple clusters with co-occurrence
-        // Sentence 0: "Machine learning algorithms" - clusters containing "machine", "learning", "algorithm"
-        // Sentence 1: "Deep learning models" - clusters containing "deep", "learning", "model"
-        // "learning" should connect the clusters
+    fn test_candidate_trim_by_pos() {
         let tokens = vec![
-            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
-            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
-            Token::new("algorithms", "algorithm", PosTag::Noun, 17, 27, 0, 2),
-            Token::new("Deep", "deep", PosTag::Adjective, 29, 33, 1, 3),
-            Token::new("learning", "learning", PosTag::Noun, 34, 42, 1, 4),
-            Token::new("models", "model", PosTag::Noun, 43, 49, 1, 5),
-            // Add more occurrences to ensure clustering happens
-            Token::new("Machine", "machine", PosTag::Noun, 51, 58, 2, 6),
-            Token::new("algorithm", "algorithm", PosTag::Noun, 59, 68, 2, 7),
+            Token::new("Deep", "deep", PosTag::Adjective, 0, 4, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 5, 13, 0, 1),
         ];
-
-        let config = TextRankConfig::default().with_top_n(10);
+        let mut config = TextRankConfig::default();
+        config.include_pos = vec![PosTag::Noun];
         let phrases = extract_keyphrases_topic(&tokens, &config);
-
-        // With edges, we should get non-uniform scores (not all equal)
-        // Verify we have phrases
-        assert!(!phrases.is_empty(), "Should extract phrases");
-
-        // If we have more than one phrase, check that they have different scores
-        // (this verifies the graph has meaningful edges)
-        if phrases.len() > 1 {
-            let first_score = phrases[0].score;
-            let _has_different_score = phrases
-                .iter()
-                .any(|p| (p.score - first_score).abs() > 1e-10);
-        }
+        assert_eq!(phrases.len(), 1);
+        assert_eq!(phrases[0].text, "learning");
     }
 
     #[test]
-    fn test_inverted_index_clustering() {
-        // Test that the inverted index approach correctly clusters candidates:
-        // - Disjoint stem sets should form separate clusters
-        // - Overlapping stem sets meeting threshold should merge
-        // - Overlapping stem sets below threshold should stay separate
+    fn test_representative_first_occurrence_and_offsets() {
+        let tokens = vec![
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("Machine", "machine", PosTag::Noun, 17, 24, 1, 2),
+            Token::new("learning", "learning", PosTag::Noun, 25, 33, 1, 3),
+        ];
+        let config = TextRankConfig::default();
+        let phrases = extract_keyphrases_topic(&tokens, &config);
+        assert_eq!(phrases.len(), 1);
+        assert_eq!(phrases[0].text, "Machine learning");
+        assert_eq!(phrases[0].offsets.len(), 2);
+        assert_eq!(phrases[0].offsets[0].0, 0);
+    }
 
+    #[test]
+    fn test_hac_clustering_thresholds() {
         use crate::types::ChunkSpan;
 
-        // Helper to create a candidate with given stems
-        fn make_candidate(stems: &[&str]) -> PhraseCandidate {
+        fn make_candidate(terms: &[&str], start_token: usize) -> PhraseCandidate {
             PhraseCandidate {
-                text: stems.join(" "),
-                lemma: stems.join(" "),
-                stems: stems.iter().map(|s| s.to_string()).collect(),
+                text: terms.join(" "),
+                lemma: terms.join(" "),
+                terms: terms.iter().map(|s| s.to_string()).collect(),
                 chunk: ChunkSpan {
-                    start_token: 0,
-                    end_token: 1,
+                    start_token,
+                    end_token: start_token + 1,
                     start_char: 0,
                     end_char: 1,
                     sentence_idx: 0,
@@ -444,96 +483,54 @@ mod tests {
 
         let topic_rank = TopicRank::new().with_similarity_threshold(0.25);
 
-        // Test 1: Completely disjoint candidates stay in separate clusters
+        // Disjoint candidates stay separate (distance 1.0 > 0.74)
         {
             let candidates = vec![
-                make_candidate(&["a", "b"]),
-                make_candidate(&["c", "d"]),
-                make_candidate(&["e", "f"]),
+                make_candidate(&["a", "b"], 0),
+                make_candidate(&["c", "d"], 1),
+                make_candidate(&["e", "f"], 2),
             ];
             let clusters = topic_rank.cluster_phrases(&candidates);
-            assert_eq!(
-                clusters.len(),
-                3,
-                "Disjoint candidates should form 3 separate clusters"
-            );
+            assert_eq!(clusters.len(), 3);
         }
 
-        // Test 2: Identical candidates merge into one cluster
+        // Identical candidates merge (distance 0.0 <= 0.74)
         {
-            let candidates = vec![make_candidate(&["a", "b"]), make_candidate(&["a", "b"])];
+            let candidates = vec![make_candidate(&["a", "b"], 0), make_candidate(&["a", "b"], 1)];
             let clusters = topic_rank.cluster_phrases(&candidates);
-            assert_eq!(
-                clusters.len(),
-                1,
-                "Identical candidates should merge into 1 cluster"
-            );
+            assert_eq!(clusters.len(), 1);
         }
 
-        // Test 3: High overlap merges, low overlap stays separate
-        // Jaccard({a,b}, {a,b,c}) = 2/3 ≈ 0.67 > 0.25, should merge
-        // Jaccard({a,b,c,d,e,f}, {a}) = 1/6 ≈ 0.17 < 0.25, should NOT merge
+        // High overlap merges, low overlap stays separate
         {
             let candidates = vec![
-                make_candidate(&["a", "b"]),      // idx 0
-                make_candidate(&["a", "b", "c"]), // idx 1 - should merge with 0
-                make_candidate(&["x", "y", "z"]), // idx 2 - disjoint
+                make_candidate(&["a", "b"], 0),
+                make_candidate(&["a", "b", "c"], 1),
+                make_candidate(&["x", "y", "z"], 2),
             ];
             let clusters = topic_rank.cluster_phrases(&candidates);
-            assert_eq!(
-                clusters.len(),
-                2,
-                "High-overlap pair should merge, disjoint should stay separate"
-            );
-
-            // Verify the merged cluster contains both overlapping candidates
-            let merged_cluster = clusters.iter().find(|c| c.len() == 2);
-            assert!(
-                merged_cluster.is_some(),
-                "Should have one cluster with 2 members"
-            );
-            let members = merged_cluster.unwrap();
-            assert!(
-                members.contains(&0) && members.contains(&1),
-                "Cluster should contain indices 0 and 1"
-            );
+            assert_eq!(clusters.len(), 2);
         }
 
-        // Test 4: Transitive clustering (A overlaps B, B overlaps C -> all in same cluster)
+        // Average linkage prevents chaining when distance exceeds cutoff
         {
             let candidates = vec![
-                make_candidate(&["a", "b"]), // idx 0
-                make_candidate(&["b", "c"]), // idx 1 - overlaps with 0 via "b"
-                make_candidate(&["c", "d"]), // idx 2 - overlaps with 1 via "c"
+                make_candidate(&["a", "b"], 0),
+                make_candidate(&["a", "b", "c"], 1),
+                make_candidate(&["c", "d"], 2),
             ];
-            // Jaccard({a,b}, {b,c}) = 1/3 ≈ 0.33 > 0.25
-            // Jaccard({b,c}, {c,d}) = 1/3 ≈ 0.33 > 0.25
             let clusters = topic_rank.cluster_phrases(&candidates);
-            assert_eq!(
-                clusters.len(),
-                1,
-                "Transitive overlap should merge all into 1 cluster"
-            );
-            assert_eq!(
-                clusters[0].len(),
-                3,
-                "Cluster should contain all 3 candidates"
-            );
+            assert_eq!(clusters.len(), 2);
         }
 
-        // Test 5: Single stem overlap below threshold stays separate
+        // Low overlap with shared term stays separate
         {
-            // Jaccard({a,b,c,d,e}, {a,x,y,z,w}) = 1/9 ≈ 0.11 < 0.25
             let candidates = vec![
-                make_candidate(&["a", "b", "c", "d", "e"]),
-                make_candidate(&["a", "x", "y", "z", "w"]),
+                make_candidate(&["a", "b", "c", "d", "e"], 0),
+                make_candidate(&["a", "x", "y", "z", "w"], 1),
             ];
             let clusters = topic_rank.cluster_phrases(&candidates);
-            assert_eq!(
-                clusters.len(),
-                2,
-                "Low Jaccard overlap should stay separate despite shared stem"
-            );
+            assert_eq!(clusters.len(), 2);
         }
     }
 }
