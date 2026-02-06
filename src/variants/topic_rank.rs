@@ -15,6 +15,7 @@ use crate::graph::builder::GraphBuilder;
 use crate::graph::csr::CsrGraph;
 use crate::pagerank::standard::StandardPageRank;
 use crate::phrase::chunker::{chunk_lemma, chunk_text, NounChunker};
+use crate::phrase::extraction::ExtractionResult;
 use crate::types::{Phrase, TextRankConfig, Token};
 use rustc_hash::FxHashSet;
 
@@ -113,6 +114,11 @@ impl TopicRank {
 
     /// Extract keyphrases using TopicRank
     pub fn extract(&self, tokens: &[Token]) -> Vec<Phrase> {
+        self.extract_with_info(tokens).phrases
+    }
+
+    /// Extract keyphrases with PageRank convergence information
+    pub fn extract_with_info(&self, tokens: &[Token]) -> ExtractionResult {
         // Extract candidate phrases
         let chunker = NounChunker::new()
             .with_min_length(self.config.min_phrase_length)
@@ -120,7 +126,11 @@ impl TopicRank {
         let chunks = chunker.extract_chunks(tokens);
 
         if chunks.is_empty() {
-            return Vec::new();
+            return ExtractionResult {
+                phrases: Vec::new(),
+                converged: true,
+                iterations: 0,
+            };
         }
 
         // Create phrase candidates
@@ -146,14 +156,22 @@ impl TopicRank {
         }
 
         if candidates.is_empty() {
-            return Vec::new();
+            return ExtractionResult {
+                phrases: Vec::new(),
+                converged: true,
+                iterations: 0,
+            };
         }
 
         // Cluster similar phrases
         let clusters = self.cluster_phrases(&candidates);
 
         if clusters.is_empty() {
-            return Vec::new();
+            return ExtractionResult {
+                phrases: Vec::new(),
+                converged: true,
+                iterations: 0,
+            };
         }
 
         // Build cluster graph
@@ -182,7 +200,11 @@ impl TopicRank {
             phrases.truncate(self.config.top_n);
         }
 
-        phrases
+        ExtractionResult {
+            phrases,
+            converged: pagerank.converged,
+            iterations: pagerank.iterations,
+        }
     }
 
     /// Cluster phrases using HAC (average linkage) over Jaccard distance

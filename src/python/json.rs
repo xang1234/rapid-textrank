@@ -6,8 +6,12 @@
 use crate::graph::builder::GraphBuilder;
 use crate::graph::csr::CsrGraph;
 use crate::pagerank::standard::StandardPageRank;
-use crate::phrase::extraction::PhraseExtractor;
+use crate::phrase::extraction::{extract_keyphrases_with_info, PhraseExtractor};
 use crate::types::{PhraseGrouping, PosTag, ScoreAggregation, TextRankConfig, Token};
+use crate::variants::biased_textrank::BiasedTextRank;
+use crate::variants::position_rank::PositionRank;
+use crate::variants::topic_rank::TopicRank;
+use crate::variants::Variant;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +50,8 @@ pub struct JsonDocument {
     pub tokens: Vec<JsonToken>,
     #[serde(default)]
     pub config: Option<JsonConfig>,
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 /// Configuration from JSON
@@ -81,6 +87,14 @@ pub struct JsonConfig {
     /// Additional stopwords list (extends built-in list when provided)
     #[serde(default)]
     pub stopwords: Vec<String>,
+    #[serde(default)]
+    pub focus_terms: Vec<String>,
+    #[serde(default = "default_bias_weight")]
+    pub bias_weight: f64,
+    #[serde(default = "default_topic_similarity_threshold")]
+    pub topic_similarity_threshold: f64,
+    #[serde(default = "default_topic_edge_weight")]
+    pub topic_edge_weight: f64,
 }
 
 fn default_use_edge_weights() -> bool {
@@ -115,6 +129,18 @@ fn default_phrase_grouping() -> String {
     "scrubbed_text".to_string()
 }
 
+fn default_bias_weight() -> f64 {
+    5.0
+}
+
+fn default_topic_similarity_threshold() -> f64 {
+    0.25
+}
+
+fn default_topic_edge_weight() -> f64 {
+    1.0
+}
+
 impl Default for JsonConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +158,10 @@ impl Default for JsonConfig {
             use_pos_in_nodes: true,
             include_pos: Vec::new(),
             stopwords: Vec::new(),
+            focus_terms: Vec::new(),
+            bias_weight: default_bias_weight(),
+            topic_similarity_threshold: default_topic_similarity_threshold(),
+            topic_edge_weight: default_topic_edge_weight(),
         }
     }
 }
@@ -212,7 +242,13 @@ pub fn extract_from_json(json_input: &str) -> PyResult<String> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
 
     // Convert config
-    let config: TextRankConfig = doc.config.unwrap_or_default().into();
+    let json_config = doc.config.unwrap_or_default();
+    let config: TextRankConfig = json_config.clone().into();
+    let variant = doc
+        .variant
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(Variant::TextRank);
 
     // Convert tokens
     let mut tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
@@ -229,41 +265,31 @@ pub fn extract_from_json(json_input: &str) -> PyResult<String> {
         }
     }
 
-    // Build graph with POS filtering from config
-    let builder = GraphBuilder::from_tokens_with_pos(
-        &tokens,
-        config.window_size,
-        config.use_edge_weights,
-        Some(&config.include_pos),
-        config.use_pos_in_nodes,
-    );
-
-    if builder.is_empty() {
-        let result = JsonResult {
-            phrases: vec![],
-            converged: true,
-            iterations: 0,
-        };
-        return serde_json::to_string(&result)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()));
-    }
-
-    let graph = CsrGraph::from_builder(&builder);
-
-    // Run PageRank
-    let pagerank = StandardPageRank::new()
-        .with_damping(config.damping)
-        .with_max_iterations(config.max_iterations)
-        .with_threshold(config.convergence_threshold)
-        .run(&graph);
-
-    // Extract phrases
-    let extractor = PhraseExtractor::with_config(config);
-    let phrases = extractor.extract(&tokens, &graph, &pagerank);
+    let extraction = match variant {
+        Variant::TextRank => extract_keyphrases_with_info(&tokens, &config),
+        Variant::PositionRank => {
+            PositionRank::with_config(config.clone()).extract_with_info(&tokens)
+        }
+        Variant::BiasedTextRank => BiasedTextRank::with_config(config.clone())
+            .with_focus(
+                &json_config
+                    .focus_terms
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .with_bias_weight(json_config.bias_weight)
+            .extract_with_info(&tokens),
+        Variant::TopicRank => TopicRank::with_config(config.clone())
+            .with_similarity_threshold(json_config.topic_similarity_threshold)
+            .with_edge_weight(json_config.topic_edge_weight)
+            .extract_with_info(&tokens),
+    };
 
     // Build result
     let result = JsonResult {
-        phrases: phrases
+        phrases: extraction
+            .phrases
             .into_iter()
             .map(|p| JsonPhrase {
                 text: p.text,
@@ -273,8 +299,8 @@ pub fn extract_from_json(json_input: &str) -> PyResult<String> {
                 rank: p.rank,
             })
             .collect(),
-        converged: pagerank.converged,
-        iterations: pagerank.iterations,
+        converged: extraction.converged,
+        iterations: extraction.iterations,
     };
 
     serde_json::to_string(&result)
