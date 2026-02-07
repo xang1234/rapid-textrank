@@ -11,7 +11,7 @@ Extract keywords and key phrases from text up to 10-100x faster than pure Python
 ## Features
 
 - **Fast**: Up to 10-100x faster than pure Python implementations (see benchmarks)
-- **Multiple algorithms**: TextRank, PositionRank, BiasedTextRank, TopicRank, and SingleRank variants
+- **Multiple algorithms**: TextRank, PositionRank, BiasedTextRank, TopicRank, SingleRank, and TopicalPageRank variants
 - **Unicode-aware**: Proper handling of CJK and other scripts (emoji are ignored by the built-in tokenizer)
 - **Multi-language**: Stopword support for 18 languages
 - **Dual API**: Native Python classes + JSON interface for batch processing
@@ -80,6 +80,7 @@ Co-occurrence graph (window=2):
 - [BiasedTextRank: Unsupervised Graph-Based Content Extraction](https://aclanthology.org/2020.coling-main.144/) (Kazemi et al., 2020)
 - [TopicRank: Graph-Based Topic Ranking for Keyphrase Extraction](https://aclanthology.org/I13-1062/) (Bougouin et al., 2013)
 - [SingleRank: Single Document Keyphrase Extraction Using Neighborhood Knowledge](https://ojs.aaai.org/index.php/AAAI/article/view/7798) (Wan & Xiao, 2008)
+- [Topical Word Importance for Fast Keyphrase Extraction](https://aclanthology.org/W15-3605/) (Sterckx et al., 2015)
 
 ## Algorithm Variants
 
@@ -90,6 +91,7 @@ Co-occurrence graph (window=2):
 | `BiasedTextRank` | Topic-focused extraction | Biases results toward specified focus terms |
 | `TopicRank` | Multi-topic documents | Clusters similar phrases into topics and ranks the topics |
 | `SingleRank` | Longer documents | Uses weighted co-occurrence edges and cross-sentence windowing |
+| `TopicalPageRank` | Topic-model-guided extraction | Biases SingleRank towards topically important words via personalized PageRank |
 
 ### PositionRank
 
@@ -195,6 +197,70 @@ SingleRank is also available via the JSON interface with `variant="single_rank"`
 
 **When to use SingleRank over BaseTextRank:** SingleRank works well on longer documents where important terms co-occur across sentence boundaries. The weighted edges amplify frequently co-occurring pairs, giving a clearer signal than the binary edges used by BaseTextRank.
 
+### Topical PageRank
+
+Topical PageRank (Sterckx et al., 2015) extends SingleRank by biasing the random walk towards topically important words. Instead of uniform teleportation, PageRank uses a personalization vector derived from per-word topic weights.
+
+Users supply pre-computed topic weights as a `{lemma: weight}` dictionary. These typically come from a topic model (e.g., LDA via gensim or sklearn), but any source of word importance scores works. Words absent from the dictionary receive a configurable minimum weight (`min_weight`, default 0.0 — matching PKE's OOV behavior).
+
+```python
+from rapid_textrank import TopicalPageRank
+
+# Topic weights from an external topic model or manual assignment
+topic_weights = {
+    "neural": 0.9,
+    "network": 0.8,
+    "learning": 0.7,
+    "deep": 0.6,
+}
+
+extractor = TopicalPageRank(
+    topic_weights=topic_weights,
+    min_weight=0.01,  # Floor for out-of-vocabulary words
+    top_n=10
+)
+
+result = extractor.extract_keywords("""
+Deep learning is a subset of machine learning that uses artificial neural
+networks. Neural networks with many layers can learn complex patterns.
+Convolutional neural networks excel at image recognition tasks.
+""")
+
+for phrase in result.phrases:
+    print(f"{phrase.text}: {phrase.score:.4f}")
+
+# Update topic weights for a different document/topic
+result = extractor.extract_keywords(
+    "Machine learning enables data-driven decisions...",
+    topic_weights={"machine": 0.9, "data": 0.8}
+)
+```
+
+TopicalPageRank is also available via the JSON interface with `variant="topical_pagerank"` (aliases: `"tpr"`, `"single_tpr"`). Set `topic_weights` and optionally `topic_min_weight` in the JSON config:
+
+```python
+import json
+from rapid_textrank import extract_from_json
+
+payload = {
+    "tokens": tokens,  # Pre-tokenized (e.g., from spaCy)
+    "variant": "topical_pagerank",
+    "config": {
+        "top_n": 10,
+        "topic_weights": {"neural": 0.9, "network": 0.8, "learning": 0.7},
+        "topic_min_weight": 0.01,
+    },
+}
+
+result = json.loads(extract_from_json(json.dumps(payload)))
+```
+
+**TopicalPageRank vs BiasedTextRank:** Both bias extraction towards specific terms, but they differ in how:
+- **BiasedTextRank** takes a list of focus terms and a single bias weight. It's manual and direct — good when you know exactly which terms matter.
+- **TopicalPageRank** takes per-word weights, typically from a topic model. It's data-driven — good when you want the topic distribution to guide extraction automatically.
+
+**Topic modeling is optional.** You can supply any word-importance scores: TF-IDF weights, embedding similarities, domain relevance scores, or hand-picked values.
+
 ## API Reference
 
 ### Convenience Function
@@ -216,7 +282,7 @@ phrases = extract_keywords(
 For more control, use the extractor classes:
 
 ```python
-from rapid_textrank import BaseTextRank, PositionRank, BiasedTextRank, SingleRank
+from rapid_textrank import BaseTextRank, PositionRank, BiasedTextRank, SingleRank, TopicalPageRank
 
 # Standard TextRank
 extractor = BaseTextRank(top_n=10, language="en")
@@ -240,6 +306,15 @@ result = extractor.extract_keywords(text, focus_terms=["neural", "network"])
 
 # SingleRank: weighted edges + cross-sentence windowing
 extractor = SingleRank(top_n=10, language="en")
+result = extractor.extract_keywords(text)
+
+# Topical PageRank: topic-weight-biased extraction
+extractor = TopicalPageRank(
+    topic_weights={"neural": 0.9, "network": 0.8},
+    min_weight=0.01,
+    top_n=10,
+    language="en"
+)
 result = extractor.extract_keywords(text)
 ```
 
@@ -333,7 +408,7 @@ results_json = extract_batch_from_json(json.dumps(docs))
 results = json.loads(results_json)
 ```
 
-`variant` can be `"textrank"` (default), `"position_rank"`, `"biased_textrank"`, `"topic_rank"`, or `"single_rank"`. For `"biased_textrank"`, set `focus_terms` and `bias_weight` in the JSON config. For `"topic_rank"`, set `topic_similarity_threshold` and `topic_edge_weight` in the JSON config.
+`variant` can be `"textrank"` (default), `"position_rank"`, `"biased_textrank"`, `"topic_rank"`, `"single_rank"`, or `"topical_pagerank"` (aliases: `"tpr"`, `"single_tpr"`). For `"biased_textrank"`, set `focus_terms` and `bias_weight` in the JSON config. For `"topic_rank"`, set `topic_similarity_threshold` and `topic_edge_weight` in the JSON config. For `"topical_pagerank"`, set `topic_weights` and optionally `topic_min_weight` in the JSON config.
 
 ## Supported Languages
 
@@ -676,5 +751,17 @@ For TopicRank:
     year = "2013",
     pages = "543--551",
     publisher = "Asian Federation of Natural Language Processing",
+}
+```
+
+For Topical PageRank:
+
+```bibtex
+@inproceedings{sterckx-etal-2015-topical,
+    title = "Topical Word Importance for Fast Keyphrase Extraction",
+    author = "Sterckx, Lucas and Demeester, Thomas and Deleu, Johannes and Develder, Chris",
+    booktitle = "Proceedings of the 24th International Conference on World Wide Web (Companion Volume)",
+    year = "2015",
+    pages = "121--122",
 }
 ```
