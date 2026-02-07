@@ -2,6 +2,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rapid_textrank::*;
+use std::collections::HashMap;
 
 /// Sample text for benchmarking
 const SAMPLE_TEXT: &str = r#"
@@ -108,6 +109,17 @@ fn benchmark_phrase_extraction(c: &mut Criterion) {
 
     let config = TextRankConfig::default().with_top_n(10);
 
+    let topic_weights: HashMap<String, f64> = [
+        ("machine", 0.8),
+        ("learning", 0.7),
+        ("intelligence", 0.6),
+        ("neural", 0.5),
+        ("data", 0.4),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+
     c.bench_function("extract_keyphrases", |b| {
         b.iter(|| phrase::extraction::extract_keyphrases(black_box(&tokens), black_box(&config)))
     });
@@ -139,6 +151,29 @@ fn benchmark_phrase_extraction(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("single_rank", |b| {
+        b.iter(|| {
+            SingleRank::with_config(config.clone())
+                .extract_with_info(black_box(&tokens))
+        })
+    });
+
+    group.bench_function("topical_pagerank", |b| {
+        b.iter(|| {
+            TopicalPageRank::with_config(config.clone())
+                .with_topic_weights(topic_weights.clone())
+                .with_min_weight(0.0)
+                .extract_with_info(black_box(&tokens))
+        })
+    });
+
+    group.bench_function("multipartite_rank", |b| {
+        b.iter(|| {
+            MultipartiteRank::with_config(config.clone())
+                .extract_with_info(black_box(&tokens))
+        })
+    });
+
     group.finish();
 }
 
@@ -149,20 +184,106 @@ fn benchmark_full_pipeline(c: &mut Criterion) {
         let text = SAMPLE_TEXT.repeat(*size);
         group.throughput(Throughput::Bytes(text.len() as u64));
 
-        group.bench_with_input(BenchmarkId::from_parameter(size), &text, |b, text| {
+        group.bench_with_input(BenchmarkId::new("standard", size), &text, |b, text| {
             b.iter(|| {
                 let tokenizer = nlp::tokenizer::Tokenizer::new();
                 let (_, mut tokens) = tokenizer.tokenize(text);
-
                 let stopwords = nlp::stopwords::StopwordFilter::new("en");
                 for token in &mut tokens {
                     token.is_stopword = stopwords.is_stopword(&token.text);
                 }
-
                 let config = TextRankConfig::default().with_top_n(10);
                 phrase::extraction::extract_keyphrases(&tokens, &config)
             })
         });
+
+        group.bench_with_input(BenchmarkId::new("position_rank", size), &text, |b, text| {
+            b.iter(|| {
+                let tokenizer = nlp::tokenizer::Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(text);
+                let stopwords = nlp::stopwords::StopwordFilter::new("en");
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
+                let config = TextRankConfig::default().with_top_n(10);
+                variants::position_rank::extract_keyphrases_position(&tokens, &config)
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("biased_textrank", size), &text, |b, text| {
+            b.iter(|| {
+                let tokenizer = nlp::tokenizer::Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(text);
+                let stopwords = nlp::stopwords::StopwordFilter::new("en");
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
+                let config = TextRankConfig::default().with_top_n(10);
+                variants::biased_textrank::extract_keyphrases_biased(
+                    &tokens, &config, &["machine", "learning"], 5.0,
+                )
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("single_rank", size), &text, |b, text| {
+            b.iter(|| {
+                let tokenizer = nlp::tokenizer::Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(text);
+                let stopwords = nlp::stopwords::StopwordFilter::new("en");
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
+                let config = TextRankConfig::default().with_top_n(10);
+                SingleRank::with_config(config).extract_with_info(&tokens)
+            })
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("topical_pagerank", size),
+            &text,
+            |b, text| {
+                b.iter(|| {
+                    let tokenizer = nlp::tokenizer::Tokenizer::new();
+                    let (_, mut tokens) = tokenizer.tokenize(text);
+                    let stopwords = nlp::stopwords::StopwordFilter::new("en");
+                    for token in &mut tokens {
+                        token.is_stopword = stopwords.is_stopword(&token.text);
+                    }
+                    let config = TextRankConfig::default().with_top_n(10);
+                    let topic_weights: HashMap<String, f64> = [
+                        ("machine", 0.8),
+                        ("learning", 0.7),
+                        ("intelligence", 0.6),
+                        ("neural", 0.5),
+                        ("data", 0.4),
+                    ]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect();
+                    TopicalPageRank::with_config(config)
+                        .with_topic_weights(topic_weights)
+                        .with_min_weight(0.0)
+                        .extract_with_info(&tokens)
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("multipartite_rank", size),
+            &text,
+            |b, text| {
+                b.iter(|| {
+                    let tokenizer = nlp::tokenizer::Tokenizer::new();
+                    let (_, mut tokens) = tokenizer.tokenize(text);
+                    let stopwords = nlp::stopwords::StopwordFilter::new("en");
+                    for token in &mut tokens {
+                        token.is_stopword = stopwords.is_stopword(&token.text);
+                    }
+                    let config = TextRankConfig::default().with_top_n(10);
+                    MultipartiteRank::with_config(config).extract_with_info(&tokens)
+                })
+            },
+        );
     }
 
     group.finish();
