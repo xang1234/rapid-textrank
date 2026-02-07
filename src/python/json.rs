@@ -80,7 +80,7 @@ pub struct JsonConfig {
     pub phrase_grouping: String,
     #[serde(default = "default_use_edge_weights")]
     pub use_edge_weights: bool,
-    #[serde(default)]
+    #[serde(default = "default_use_pos_in_nodes")]
     pub use_pos_in_nodes: bool,
     /// POS tags to include (e.g., ["NOUN", "ADJ", "PROPN"])
     #[serde(default)]
@@ -111,6 +111,9 @@ pub struct JsonConfig {
 }
 
 fn default_use_edge_weights() -> bool {
+    true
+}
+fn default_use_pos_in_nodes() -> bool {
     true
 }
 
