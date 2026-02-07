@@ -38,3 +38,5 @@ bd sync               # Sync with git
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 
+# PY03
+- use PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 to avoid compatibility issues
