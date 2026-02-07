@@ -14,6 +14,7 @@ def test_import():
     assert hasattr(rapid_textrank, "BaseTextRank")
     assert hasattr(rapid_textrank, "PositionRank")
     assert hasattr(rapid_textrank, "BiasedTextRank")
+    assert hasattr(rapid_textrank, "SingleRank")
 
 
 def test_version():
@@ -145,6 +146,84 @@ class TestBiasedTextRank:
         # Both should produce results
         assert len(result1.phrases) > 0
         assert len(result2.phrases) > 0
+
+
+class TestSingleRank:
+    """Tests for SingleRank extractor."""
+
+    def test_extract_keywords_basic(self):
+        """Test basic SingleRank keyword extraction."""
+        from rapid_textrank import SingleRank
+
+        extractor = SingleRank(top_n=5)
+        result = extractor.extract_keywords(
+            "Machine learning is a subset of artificial intelligence. "
+            "Deep learning is a type of machine learning. "
+            "Neural networks are used in deep learning."
+        )
+
+        assert len(result.phrases) > 0
+        assert result.converged
+        assert all(p.score > 0 for p in result.phrases)
+
+    def test_empty_input(self):
+        """Test handling of empty input."""
+        from rapid_textrank import SingleRank
+
+        extractor = SingleRank()
+        result = extractor.extract_keywords("")
+
+        assert len(result.phrases) == 0
+
+    def test_cross_sentence_keywords(self):
+        """Test that cross-sentence co-occurrences are captured."""
+        from rapid_textrank import SingleRank
+
+        extractor = SingleRank(top_n=10)
+        # "data science" spans sentence boundaries
+        result = extractor.extract_keywords(
+            "Modern data science is evolving. "
+            "Science and data drive decisions. "
+            "Data science applications are growing."
+        )
+
+        assert len(result.phrases) > 0
+        top_texts = [p.text.lower() for p in result.phrases]
+        assert any("data" in t or "science" in t for t in top_texts)
+
+
+class TestSingleRankJson:
+    """Tests for SingleRank via JSON interface."""
+
+    def test_json_variant_single_rank(self):
+        """Test SingleRank through the JSON API."""
+        from rapid_textrank import extract_from_json
+
+        doc = {
+            "tokens": [
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN",
+                 "start": 0, "end": 7, "sentence_idx": 0, "token_idx": 0,
+                 "is_stopword": False},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN",
+                 "start": 8, "end": 16, "sentence_idx": 0, "token_idx": 1,
+                 "is_stopword": False},
+                {"text": "deep", "lemma": "deep", "pos": "ADJ",
+                 "start": 18, "end": 22, "sentence_idx": 1, "token_idx": 2,
+                 "is_stopword": False},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN",
+                 "start": 23, "end": 31, "sentence_idx": 1, "token_idx": 3,
+                 "is_stopword": False},
+            ],
+            "variant": "single_rank",
+            "config": {"top_n": 5},
+        }
+
+        result_json = extract_from_json(json.dumps(doc))
+        result = json.loads(result_json)
+
+        assert "phrases" in result
+        assert "converged" in result
+        assert len(result["phrases"]) > 0
 
 
 class TestTextRankConfig:

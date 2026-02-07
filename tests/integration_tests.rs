@@ -117,6 +117,40 @@ fn test_biased_textrank_pipeline() {
 }
 
 #[test]
+fn test_single_rank_pipeline() {
+    let tokenizer = nlp::tokenizer::Tokenizer::new();
+    let (_, mut tokens) = tokenizer.tokenize(SAMPLE_TEXT);
+
+    let stopwords = nlp::stopwords::StopwordFilter::new("en");
+    for token in &mut tokens {
+        token.is_stopword = stopwords.is_stopword(&token.text);
+    }
+
+    let config = TextRankConfig::default().with_top_n(10);
+    let result =
+        variants::single_rank::SingleRank::with_config(config).extract_with_info(&tokens);
+
+    assert!(!result.phrases.is_empty());
+    assert!(result.converged);
+
+    // Verify phrase properties
+    for (i, phrase) in result.phrases.iter().enumerate() {
+        assert_eq!(phrase.rank, i + 1);
+        assert!(phrase.score > 0.0);
+        assert!(!phrase.text.is_empty());
+    }
+
+    // "learn" / "data" are core topics in SAMPLE_TEXT and should appear
+    // somewhere in the results (using contains to match lemma variants).
+    let all_lemmas: Vec<&str> = result.phrases.iter().map(|p| p.lemma.as_str()).collect();
+    assert!(
+        all_lemmas.iter().any(|l| l.contains("learn") || l.contains("data")),
+        "Expected 'learn' or 'data' in top phrases, got: {:?}",
+        all_lemmas
+    );
+}
+
+#[test]
 fn test_summarization_pipeline() {
     let tokenizer = nlp::tokenizer::Tokenizer::new();
     let (sentences, mut tokens) = tokenizer.tokenize(SAMPLE_TEXT);

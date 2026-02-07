@@ -11,7 +11,7 @@ Extract keywords and key phrases from text up to 10-100x faster than pure Python
 ## Features
 
 - **Fast**: Up to 10-100x faster than pure Python implementations (see benchmarks)
-- **Multiple algorithms**: TextRank, PositionRank, BiasedTextRank, and TopicRank variants
+- **Multiple algorithms**: TextRank, PositionRank, BiasedTextRank, TopicRank, and SingleRank variants
 - **Unicode-aware**: Proper handling of CJK and other scripts (emoji are ignored by the built-in tokenizer)
 - **Multi-language**: Stopword support for 18 languages
 - **Dual API**: Native Python classes + JSON interface for batch processing
@@ -79,6 +79,7 @@ Co-occurrence graph (window=2):
 - [PositionRank: An Unsupervised Approach to Keyphrase Extraction](https://aclanthology.org/P17-1102/) (Florescu & Caragea, 2017)
 - [BiasedTextRank: Unsupervised Graph-Based Content Extraction](https://aclanthology.org/2020.coling-main.144/) (Kazemi et al., 2020)
 - [TopicRank: Graph-Based Topic Ranking for Keyphrase Extraction](https://aclanthology.org/I13-1062/) (Bougouin et al., 2013)
+- [SingleRank: Single Document Keyphrase Extraction Using Neighborhood Knowledge](https://ojs.aaai.org/index.php/AAAI/article/view/7798) (Wan & Xiao, 2008)
 
 ## Algorithm Variants
 
@@ -88,6 +89,7 @@ Co-occurrence graph (window=2):
 | `PositionRank` | Academic papers, news | Favors words appearing early in the document |
 | `BiasedTextRank` | Topic-focused extraction | Biases results toward specified focus terms |
 | `TopicRank` | Multi-topic documents | Clusters similar phrases into topics and ranks the topics |
+| `SingleRank` | Longer documents | Uses weighted co-occurrence edges and cross-sentence windowing |
 
 ### PositionRank
 
@@ -171,6 +173,28 @@ for phrase in result["phrases"][:10]:
     print(phrase["text"], phrase["score"])
 ```
 
+### SingleRank
+
+SingleRank (Wan & Xiao, 2008) extends TextRank in two ways: edges are weighted by co-occurrence count (repeated neighbors get stronger connections), and the sliding window ignores sentence boundaries so that terms at the end of one sentence connect to terms at the start of the next.
+
+```python
+from rapid_textrank import SingleRank
+
+extractor = SingleRank(top_n=10)
+result = extractor.extract_keywords("""
+Machine learning is a powerful tool. Deep learning is a subset of
+machine learning. Neural networks power deep learning systems.
+""")
+
+# Cross-sentence co-occurrences strengthen "machine learning" edges
+for phrase in result.phrases:
+    print(f"{phrase.text}: {phrase.score:.4f}")
+```
+
+SingleRank is also available via the JSON interface with `variant="single_rank"`.
+
+**When to use SingleRank over BaseTextRank:** SingleRank works well on longer documents where important terms co-occur across sentence boundaries. The weighted edges amplify frequently co-occurring pairs, giving a clearer signal than the binary edges used by BaseTextRank.
+
 ## API Reference
 
 ### Convenience Function
@@ -192,7 +216,7 @@ phrases = extract_keywords(
 For more control, use the extractor classes:
 
 ```python
-from rapid_textrank import BaseTextRank, PositionRank, BiasedTextRank
+from rapid_textrank import BaseTextRank, PositionRank, BiasedTextRank, SingleRank
 
 # Standard TextRank
 extractor = BaseTextRank(top_n=10, language="en")
@@ -213,6 +237,10 @@ result = extractor.extract_keywords(text)
 
 # You can also pass focus_terms per-call
 result = extractor.extract_keywords(text, focus_terms=["neural", "network"])
+
+# SingleRank: weighted edges + cross-sentence windowing
+extractor = SingleRank(top_n=10, language="en")
+result = extractor.extract_keywords(text)
 ```
 
 TopicRank is available via the JSON interface using `variant="topic_rank"` (see below).
@@ -305,7 +333,7 @@ results_json = extract_batch_from_json(json.dumps(docs))
 results = json.loads(results_json)
 ```
 
-`variant` can be `"textrank"` (default), `"position_rank"`, `"biased_textrank"`, or `"topic_rank"`. For `"biased_textrank"`, set `focus_terms` and `bias_weight` in the JSON config. For `"topic_rank"`, set `topic_similarity_threshold` and `topic_edge_weight` in the JSON config.
+`variant` can be `"textrank"` (default), `"position_rank"`, `"biased_textrank"`, `"topic_rank"`, or `"single_rank"`. For `"biased_textrank"`, set `focus_terms` and `bias_weight` in the JSON config. For `"topic_rank"`, set `topic_similarity_threshold` and `topic_edge_weight` in the JSON config.
 
 ## Supported Languages
 
@@ -623,6 +651,18 @@ For PositionRank:
     author = "Florescu, Corina and Caragea, Cornelia",
     booktitle = "Proceedings of ACL 2017",
     year = "2017",
+}
+```
+
+For SingleRank:
+
+```bibtex
+@inproceedings{wan-xiao-2008-singlerank,
+    title = "Single Document Keyphrase Extraction Using Neighborhood Knowledge",
+    author = "Wan, Xiaojun and Xiao, Jianguo",
+    booktitle = "Proceedings of the Twenty-Third AAAI Conference on Artificial Intelligence (AAAI 2008)",
+    year = "2008",
+    pages = "855--860",
 }
 ```
 
