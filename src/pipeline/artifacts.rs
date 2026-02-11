@@ -207,6 +207,25 @@ impl TokenStream {
         }
     }
 
+    /// Mutable access to all token entries.
+    ///
+    /// Used by [`Preprocessor`](super::traits::Preprocessor) stages to modify
+    /// token metadata in place (e.g., normalizing POS tags, toggling stopword
+    /// flags).
+    #[inline]
+    pub fn tokens_mut(&mut self) -> &mut [TokenEntry] {
+        &mut self.tokens
+    }
+
+    /// Mutable access to the string pool.
+    ///
+    /// Allows [`Preprocessor`](super::traits::Preprocessor) stages to intern
+    /// new strings (e.g., re-lemmatizing tokens with a different strategy).
+    #[inline]
+    pub fn pool_mut(&mut self) -> &mut StringPool {
+        &mut self.pool
+    }
+
     /// Resolve the surface text for a token entry.
     #[inline]
     pub fn text(&self, entry: &TokenEntry) -> &str {

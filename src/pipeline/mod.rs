@@ -25,3 +25,6 @@ pub use artifacts::{
     GraphStats, PhraseCandidate, PhraseEntry, PhraseSet, PhraseSetRef, PipelineWorkspace,
     RankDiagnostics, RankOutput, TokenEntry, TokenStream, TokenStreamRef, WordCandidate,
 };
+
+// Re-export stage traits and default implementations.
+pub use traits::{NoopPreprocessor, Preprocessor};
