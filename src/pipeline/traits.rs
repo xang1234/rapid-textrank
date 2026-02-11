@@ -5,8 +5,9 @@
 //! feature gate for dynamic composition.
 
 use crate::pipeline::artifacts::{
-    CandidateKind, CandidateSet, CandidateSetRef, Graph, PhraseCandidate, PhraseSet, RankOutput,
-    TeleportVector, TokenStream, TokenStreamRef, WordCandidate,
+    CandidateKind, CandidateSet, CandidateSetRef, DebugPayload, FormattedResult, Graph,
+    PhraseCandidate, PhraseSet, RankOutput, TeleportVector, TokenStream, TokenStreamRef,
+    WordCandidate,
 };
 use crate::types::{ChunkSpan, PosTag, TextRankConfig};
 
@@ -655,8 +656,109 @@ impl Ranker for PageRankRanker {
     }
 }
 
-// Future E3 stage traits will be added below:
-//   - ResultFormatter       (textranker-4a0.8)
+// ============================================================================
+// ResultFormatter — phrases + metadata → public output (stage 5)
+// ============================================================================
+
+/// Formats internal pipeline artifacts into the public [`FormattedResult`].
+///
+/// This is the **formatting boundary** — the last stage of the pipeline.
+/// Everything before this point uses interned IDs and internal types;
+/// the formatter materializes strings, attaches convergence metadata, and
+/// optionally appends debug information.
+///
+/// # Contract
+///
+/// - **Input**: a [`PhraseSet`] (scored phrases from the phrase builder),
+///   a [`RankOutput`] (convergence metadata), an optional [`DebugPayload`],
+///   and config.
+/// - **Output**: a [`FormattedResult`] — the stable public contract exposed
+///   to Python and JSON consumers.
+/// - **Deterministic**: same input → same output.
+///
+/// # Implementations
+///
+/// - **[`StandardResultFormatter`]**: Preserves the existing `FormattedResult`
+///   format exactly — converts `PhraseEntry` to `Phrase`, populates
+///   convergence fields, and attaches debug payload when present.
+pub trait ResultFormatter {
+    /// Format pipeline artifacts into the public output.
+    fn format(
+        &self,
+        phrases: &PhraseSet,
+        ranks: &RankOutput,
+        debug: Option<DebugPayload>,
+        cfg: &TextRankConfig,
+    ) -> FormattedResult;
+}
+
+/// Standard result formatter — the default for all pipeline configurations.
+///
+/// Converts [`PhraseEntry`] items into [`Phrase`] objects, attaches convergence
+/// metadata from [`RankOutput`], and passes through the optional debug payload.
+///
+/// The output preserves today's public `FormattedResult` format exactly:
+///
+/// - Phrases are ordered by score descending (as produced by PhraseBuilder).
+/// - `converged` and `iterations` come from PageRank output.
+/// - Debug information is attached only when provided.
+///
+/// This is zero-sized because all configuration is read from [`TextRankConfig`]
+/// at call time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StandardResultFormatter;
+
+impl ResultFormatter for StandardResultFormatter {
+    fn format(
+        &self,
+        phrases: &PhraseSet,
+        ranks: &RankOutput,
+        debug: Option<DebugPayload>,
+        _cfg: &TextRankConfig,
+    ) -> FormattedResult {
+        use crate::types::Phrase;
+
+        let formatted_phrases: Vec<Phrase> = phrases
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let text = entry.surface.clone().unwrap_or_default();
+                let lemma = entry.lemma_text.clone().unwrap_or_default();
+                let offsets = entry
+                    .spans
+                    .as_ref()
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .map(|&(s, e)| (s as usize, e as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Phrase {
+                    text,
+                    lemma,
+                    score: entry.score,
+                    count: entry.count as usize,
+                    offsets,
+                    rank: idx + 1, // 1-indexed rank
+                }
+            })
+            .collect();
+
+        let result = FormattedResult::new(
+            formatted_phrases,
+            ranks.converged(),
+            ranks.iterations(),
+        );
+
+        match debug {
+            Some(d) => result.with_debug(d),
+            None => result,
+        }
+    }
+}
 
 // ============================================================================
 // PhraseBuilder — token + rank → scored phrases (stage 4)
@@ -2711,5 +2813,278 @@ mod tests {
             !phrases.is_empty(),
             "ChunkPhraseBuilder should work with cross-sentence graphs"
         );
+    }
+
+    // ================================================================
+    // ResultFormatter tests
+    // ================================================================
+
+    /// Build the full pipeline through to PhraseSet for formatter testing.
+    fn build_phrases(tokens: &[Token]) -> (PhraseSet, RankOutput) {
+        let (stream, cs, graph, ranks) = build_full_pipeline(tokens);
+        let cfg = TextRankConfig::default();
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+        (phrases, ranks)
+    }
+
+    #[test]
+    fn test_standard_formatter_produces_phrases() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert!(
+            !result.phrases.is_empty(),
+            "StandardResultFormatter should produce phrases"
+        );
+    }
+
+    #[test]
+    fn test_standard_formatter_preserves_phrase_count() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(
+            result.phrases.len(),
+            phrases.len(),
+            "Number of output phrases should match PhraseSet entries"
+        );
+    }
+
+    #[test]
+    fn test_standard_formatter_sets_convergence() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(result.converged, ranks.converged());
+        assert_eq!(result.iterations, ranks.iterations());
+    }
+
+    #[test]
+    fn test_standard_formatter_ranks_are_1_indexed() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        for (i, phrase) in result.phrases.iter().enumerate() {
+            assert_eq!(
+                phrase.rank,
+                i + 1,
+                "Rank should be 1-indexed sequential"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_formatter_preserves_scores() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        for (output, entry) in result.phrases.iter().zip(phrases.entries().iter()) {
+            assert!(
+                (output.score - entry.score).abs() < 1e-10,
+                "Scores should be preserved exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_formatter_preserves_surface_forms() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        for (output, entry) in result.phrases.iter().zip(phrases.entries().iter()) {
+            let expected_text = entry.surface.clone().unwrap_or_default();
+            assert_eq!(
+                output.text, expected_text,
+                "Surface form should be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_formatter_no_debug_by_default() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert!(
+            result.debug.is_none(),
+            "Debug payload should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn test_standard_formatter_attaches_debug() {
+        let tokens = phrase_test_tokens();
+        let (phrases, ranks) = build_phrases(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let debug = DebugPayload {
+            node_scores: Some(vec![("machine|NOUN".to_string(), 0.5)]),
+            graph_stats: Some(crate::pipeline::artifacts::GraphStats {
+                num_nodes: 5,
+                num_edges: 8,
+            }),
+            stage_timings: None,
+            residuals: None,
+        };
+
+        let result =
+            StandardResultFormatter.format(&phrases, &ranks, Some(debug), &cfg);
+
+        assert!(result.debug.is_some(), "Debug payload should be attached");
+        let d = result.debug.unwrap();
+        assert!(d.node_scores.is_some());
+        assert_eq!(d.node_scores.as_ref().unwrap().len(), 1);
+        assert!(d.graph_stats.is_some());
+        assert_eq!(d.graph_stats.as_ref().unwrap().num_nodes, 5);
+    }
+
+    #[test]
+    fn test_standard_formatter_empty_phrases() {
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![],
+                iterations: 0,
+                delta: 0.0,
+                converged: true,
+            },
+        );
+        let phrases = PhraseSet::from_entries(vec![]);
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert!(result.phrases.is_empty());
+        assert!(result.converged);
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_standard_formatter_preserves_offsets() {
+        use crate::pipeline::artifacts::PhraseEntry;
+
+        // Build a PhraseSet with explicit spans.
+        let entry = PhraseEntry {
+            lemma_ids: vec![0, 1],
+            score: 1.5,
+            count: 2,
+            surface: Some("machine learning".to_string()),
+            lemma_text: Some("machine learning".to_string()),
+            spans: Some(vec![(0, 16), (42, 55)]),
+        };
+        let phrases = PhraseSet::from_entries(vec![entry]);
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![0.5, 0.3],
+                iterations: 50,
+                delta: 1e-7,
+                converged: true,
+            },
+        );
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(result.phrases.len(), 1);
+        let p = &result.phrases[0];
+        assert_eq!(p.text, "machine learning");
+        assert_eq!(p.count, 2);
+        assert_eq!(p.offsets, vec![(0, 16), (42, 55)]);
+        assert_eq!(p.rank, 1);
+    }
+
+    #[test]
+    fn test_standard_formatter_handles_missing_surface() {
+        use crate::pipeline::artifacts::PhraseEntry;
+
+        // Entry with no surface/lemma strings (would happen for truly
+        // interned-only entries in a future native PhraseBuilder).
+        let entry = PhraseEntry {
+            lemma_ids: vec![0],
+            score: 0.8,
+            count: 1,
+            surface: None,
+            lemma_text: None,
+            spans: None,
+        };
+        let phrases = PhraseSet::from_entries(vec![entry]);
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![0.8],
+                iterations: 10,
+                delta: 1e-6,
+                converged: true,
+            },
+        );
+        let cfg = TextRankConfig::default();
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(result.phrases.len(), 1);
+        // Missing surface/lemma default to empty string.
+        assert_eq!(result.phrases[0].text, "");
+        assert_eq!(result.phrases[0].lemma, "");
+        assert!(result.phrases[0].offsets.is_empty());
+    }
+
+    #[test]
+    fn test_standard_formatter_full_pipeline_roundtrip() {
+        // End-to-end: tokens → candidates → graph → rank → phrases → format
+        let tokens = phrase_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = WordNodeSelector.select(stream.as_ref(), &cfg);
+        let graph = CooccurrenceGraphBuilder::default().build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &cfg,
+        );
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        let result = StandardResultFormatter.format(&phrases, &ranks, None, &cfg);
+
+        // Verify the full pipeline produces coherent output.
+        assert!(!result.phrases.is_empty());
+        assert!(result.converged);
+        assert!(result.iterations > 0);
+        // Phrases should have positive scores.
+        for p in &result.phrases {
+            assert!(p.score > 0.0, "All phrases should have positive scores");
+            assert!(!p.text.is_empty(), "All phrases should have surface text");
+            assert!(p.rank > 0, "Ranks should be 1-indexed");
+        }
     }
 }

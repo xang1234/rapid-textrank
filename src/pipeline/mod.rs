@@ -31,6 +31,7 @@ pub use artifacts::{
 pub use traits::{
     CandidateSelector, ChunkPhraseBuilder, CooccurrenceGraphBuilder, EdgeWeightPolicy,
     GraphBuilder, GraphTransform, NoopGraphTransform, NoopPreprocessor, PageRankRanker,
-    PhraseBuilder, PhraseCandidateSelector, Preprocessor, Ranker, TeleportBuilder,
-    UniformTeleportBuilder, WindowStrategy, WordNodeSelector,
+    PhraseBuilder, PhraseCandidateSelector, Preprocessor, Ranker, ResultFormatter,
+    StandardResultFormatter, TeleportBuilder, UniformTeleportBuilder, WindowStrategy,
+    WordNodeSelector,
 };

@@ -46,8 +46,8 @@ pub use pipeline::validation::{ValidationEngine, ValidationReport};
 pub use pipeline::{
     CandidateSelector, ChunkPhraseBuilder, CooccurrenceGraphBuilder, EdgeWeightPolicy,
     NoopGraphTransform, NoopPreprocessor, PhraseBuilder, PhraseCandidateSelector, Preprocessor,
-    TeleportBuilder, TeleportVector, TokenEntry, TokenStream, TokenStreamRef,
-    UniformTeleportBuilder, WindowStrategy, WordNodeSelector,
+    ResultFormatter, StandardResultFormatter, TeleportBuilder, TeleportVector, TokenEntry,
+    TokenStream, TokenStreamRef, UniformTeleportBuilder, WindowStrategy, WordNodeSelector,
 };
 // Note: pipeline::GraphBuilder trait is NOT re-exported here to avoid
 // collision with graph::builder::GraphBuilder (the mutable builder struct).
