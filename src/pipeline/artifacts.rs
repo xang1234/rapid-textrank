@@ -311,6 +311,33 @@ impl<'a> TokenStreamRef<'a> {
     pub fn lemma(&self, entry: &TokenEntry) -> &'a str {
         self.pool.get(entry.lemma_id).unwrap_or("")
     }
+
+    /// Convert back to the legacy `Vec<Token>` representation.
+    ///
+    /// This is the bridge for pipeline stages that delegate to existing code
+    /// paths operating on `&[Token]`.  The conversion materializes all interned
+    /// strings, so it should only be used in adapter implementations — native
+    /// pipeline stages should work directly with [`TokenEntry`].
+    pub fn to_legacy_tokens(&self) -> Vec<Token> {
+        self.tokens
+            .iter()
+            .map(|e| {
+                let text = self.pool.get(e.text_id).unwrap_or("").to_string();
+                let lemma = self.pool.get(e.lemma_id).unwrap_or("").to_string();
+                let mut t = Token::new(
+                    text,
+                    lemma,
+                    e.pos,
+                    e.start as usize,
+                    e.end as usize,
+                    e.sentence_idx as usize,
+                    e.token_idx as usize,
+                );
+                t.is_stopword = e.is_stopword;
+                t
+            })
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -1008,6 +1035,19 @@ impl RankOutput {
     #[inline]
     pub fn num_nodes(&self) -> usize {
         self.scores.len()
+    }
+
+    /// Convert to the legacy [`PageRankResult`] type.
+    ///
+    /// This is the bridge for pipeline stages that delegate to existing code
+    /// paths.  Clones the score vector.
+    pub fn to_pagerank_result(&self) -> crate::pagerank::PageRankResult {
+        crate::pagerank::PageRankResult {
+            scores: self.scores.clone(),
+            iterations: self.iterations as usize,
+            delta: self.final_delta,
+            converged: self.converged,
+        }
     }
 }
 

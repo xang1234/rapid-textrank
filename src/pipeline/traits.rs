@@ -5,7 +5,7 @@
 //! feature gate for dynamic composition.
 
 use crate::pipeline::artifacts::{
-    CandidateKind, CandidateSet, CandidateSetRef, Graph, PhraseCandidate, RankOutput,
+    CandidateKind, CandidateSet, CandidateSetRef, Graph, PhraseCandidate, PhraseSet, RankOutput,
     TeleportVector, TokenStream, TokenStreamRef, WordCandidate,
 };
 use crate::types::{ChunkSpan, PosTag, TextRankConfig};
@@ -656,8 +656,109 @@ impl Ranker for PageRankRanker {
 }
 
 // Future E3 stage traits will be added below:
-//   - PhraseBuilder         (textranker-4a0.7)
 //   - ResultFormatter       (textranker-4a0.8)
+
+// ============================================================================
+// PhraseBuilder — token + rank → scored phrases (stage 4)
+// ============================================================================
+
+/// Builds scored phrases from tokens, candidates, graph, and PageRank output.
+///
+/// This is stage 4 of the pipeline — it takes the ranked graph and produces
+/// a [`PhraseSet`] of scored phrases ready for formatting.  Different
+/// implementations handle different phrase-building strategies:
+///
+/// - **[`ChunkPhraseBuilder`]**: Standard noun-chunking + score aggregation +
+///   overlap resolution + grouping.  Used by BaseTextRank, PositionRank,
+///   BiasedTextRank, SingleRank, and TopicalPageRank.
+///
+/// - **Topic representative selection** (future): TopicRank selects the
+///   first-occurring phrase from each scored cluster.
+///
+/// - **Direct candidate extraction** (future): MultipartiteRank returns the
+///   top-scoring candidates directly from the ranked candidate graph.
+///
+/// # Contract
+///
+/// - **Input**: a borrowed [`TokenStreamRef`] (read-only), a
+///   [`CandidateSetRef`], the [`RankOutput`] from PageRank, an immutable
+///   [`Graph`] reference (for node-key-to-score mapping), and config.
+/// - **Output**: a [`PhraseSet`] containing scored, deduplicated phrases.
+/// - **Deterministic**: same input → same output (no internal randomness).
+/// - **Config-driven**: reads `min_phrase_length`, `max_phrase_length`,
+///   `score_aggregation`, `phrase_grouping`, and `top_n` from
+///   [`TextRankConfig`].
+pub trait PhraseBuilder {
+    /// Build scored phrases from ranked graph data.
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        ranks: &RankOutput,
+        graph: &Graph,
+        cfg: &TextRankConfig,
+    ) -> PhraseSet;
+}
+
+/// Standard chunk-based phrase builder for the word-graph TextRank family.
+///
+/// Implements the canonical TextRank phrase extraction pipeline:
+///
+/// 1. **Noun chunking**: extract candidate phrases using the pattern
+///    `(DET)? (ADJ)* (NOUN|PROPN)+`, respecting sentence boundaries and
+///    stopword-based chunk breaks.
+/// 2. **Chunk scoring**: aggregate PageRank scores of the constituent
+///    tokens in each chunk using the configured [`ScoreAggregation`]
+///    strategy (sum, mean, max, or RMS).
+/// 3. **Overlap resolution**: greedily select the highest-scoring
+///    non-overlapping chunks.
+/// 4. **Variant grouping**: group surface-form variants by lemma or
+///    scrubbed text (controlled by [`PhraseGrouping`]), selecting a
+///    canonical form and aggregating counts/offsets.
+/// 5. **Ranking**: sort by score descending and apply `top_n` limit.
+///
+/// This is the default phrase builder used by BaseTextRank, PositionRank,
+/// BiasedTextRank, SingleRank, and TopicalPageRank.  It is zero-sized
+/// because all configuration is read from [`TextRankConfig`] at call time.
+///
+/// # Implementation note
+///
+/// Currently delegates to the existing [`PhraseExtractor`] via a legacy
+/// adapter bridge.  A native implementation working directly on
+/// [`TokenEntry`] can be substituted later without changing the trait
+/// contract.
+///
+/// [`ScoreAggregation`]: crate::types::ScoreAggregation
+/// [`PhraseGrouping`]: crate::types::PhraseGrouping
+/// [`PhraseExtractor`]: crate::phrase::extraction::PhraseExtractor
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkPhraseBuilder;
+
+impl PhraseBuilder for ChunkPhraseBuilder {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        _candidates: CandidateSetRef<'_>,
+        ranks: &RankOutput,
+        graph: &Graph,
+        cfg: &TextRankConfig,
+    ) -> PhraseSet {
+        use crate::phrase::extraction::PhraseExtractor;
+        use crate::types::StringPool;
+
+        // Bridge: convert pipeline artifacts to legacy types.
+        let legacy_tokens = tokens.to_legacy_tokens();
+        let pagerank_result = ranks.to_pagerank_result();
+
+        // Delegate to the existing PhraseExtractor.
+        let extractor = PhraseExtractor::with_config(cfg.clone());
+        let phrases = extractor.extract(&legacy_tokens, graph.csr(), &pagerank_result);
+
+        // Convert back to pipeline artifact.
+        let mut pool = StringPool::new();
+        PhraseSet::from_phrases(&phrases, &mut pool)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2189,5 +2290,426 @@ mod tests {
         let output2 = PageRankRanker.rank(&graph, Some(&tv), &cfg);
 
         assert_eq!(output1.scores(), output2.scores());
+    }
+
+    // ================================================================
+    // PhraseBuilder — ChunkPhraseBuilder tests
+    // ================================================================
+
+    /// Helper: build a full pipeline from tokens through ranking,
+    /// returning everything needed for PhraseBuilder testing.
+    fn build_full_pipeline(tokens: &[Token]) -> (TokenStream, CandidateSet, Graph, RankOutput) {
+        let stream = TokenStream::from_tokens(tokens);
+        let cfg = TextRankConfig::default();
+        let cs = WordNodeSelector.select(stream.as_ref(), &cfg);
+        let graph = CooccurrenceGraphBuilder::default().build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &cfg,
+        );
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+        (stream, cs, graph, ranks)
+    }
+
+    /// Richer token set for phrase builder testing.
+    ///
+    /// Two sentences with enough nouns to produce multi-word phrases:
+    /// "Machine learning algorithms process data"
+    /// "Deep learning models train fast"
+    fn phrase_test_tokens() -> Vec<Token> {
+        let mut tokens = vec![
+            // Sentence 0: "Machine learning algorithms process data"
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("algorithms", "algorithm", PosTag::Noun, 17, 27, 0, 2),
+            Token::new("process", "process", PosTag::Verb, 28, 35, 0, 3),
+            Token::new("data", "data", PosTag::Noun, 36, 40, 0, 4),
+            // Sentence 1: "Deep learning models train fast"
+            Token::new("Deep", "deep", PosTag::Adjective, 42, 46, 1, 5),
+            Token::new("learning", "learning", PosTag::Noun, 47, 55, 1, 6),
+            Token::new("models", "model", PosTag::Noun, 56, 62, 1, 7),
+            Token::new("train", "train", PosTag::Verb, 63, 68, 1, 8),
+            Token::new("fast", "fast", PosTag::Adverb, 69, 73, 1, 9),
+        ];
+        // Mark common verbs as stopwords (they are content words but won't
+        // form noun phrase cores).
+        tokens[3].is_stopword = false; // "process" verb
+        tokens[8].is_stopword = false; // "train" verb
+        tokens
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_produces_phrases() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Should produce at least one phrase.
+        assert!(
+            !phrases.is_empty(),
+            "ChunkPhraseBuilder should produce phrases from non-trivial input"
+        );
+
+        // All phrases should have positive scores.
+        for entry in phrases.entries() {
+            assert!(
+                entry.score > 0.0,
+                "Phrase score should be positive, got {}",
+                entry.score
+            );
+            assert!(entry.count > 0, "Phrase count should be positive");
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_respects_top_n() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let mut cfg = TextRankConfig::default();
+        cfg.top_n = 1;
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(
+            phrases.len() <= 1,
+            "top_n=1 should produce at most 1 phrase, got {}",
+            phrases.len()
+        );
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_empty_tokens() {
+        let stream = TokenStream::from_tokens(&[]);
+        let cfg = TextRankConfig::default();
+        let cs = WordNodeSelector.select(stream.as_ref(), &cfg);
+        let graph = CooccurrenceGraphBuilder::default().build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &cfg,
+        );
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(phrases.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_single_noun() {
+        let tokens = vec![
+            Token::new("Rust", "rust", PosTag::Noun, 0, 4, 0, 0),
+        ];
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Single noun should produce one single-word phrase.
+        assert_eq!(phrases.len(), 1);
+        let entry = &phrases.entries()[0];
+        assert!(entry.score > 0.0);
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_no_nouns() {
+        // Only stopwords and verbs — no noun phrases possible.
+        let mut tokens = vec![
+            Token::new("is", "be", PosTag::Verb, 0, 2, 0, 0),
+            Token::new("very", "very", PosTag::Adverb, 3, 7, 0, 1),
+            Token::new("quickly", "quickly", PosTag::Adverb, 8, 15, 0, 2),
+        ];
+        tokens[0].is_stopword = true;
+
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // No noun chunks → no phrases.
+        assert!(phrases.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_sorted_by_score() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let mut cfg = TextRankConfig::default();
+        cfg.top_n = 20; // Don't limit.
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Phrases should be in descending score order.
+        for w in phrases.entries().windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "Phrases should be sorted by score descending: {} >= {}",
+                w[0].score,
+                w[1].score,
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_surface_forms_materialized() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // All phrase entries from ChunkPhraseBuilder (bridged via
+        // PhraseSet::from_phrases) should have surface and lemma_text
+        // materialized.
+        for entry in phrases.entries() {
+            assert!(
+                entry.surface.is_some(),
+                "Surface form should be materialized"
+            );
+            assert!(
+                entry.lemma_text.is_some(),
+                "Lemma text should be materialized"
+            );
+            assert!(
+                !entry.surface.as_ref().unwrap().is_empty(),
+                "Surface form should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_min_phrase_length() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let mut cfg = TextRankConfig::default();
+        cfg.min_phrase_length = 2; // Only multi-word phrases.
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // All phrases should have at least 2 lemma tokens.
+        for entry in phrases.entries() {
+            assert!(
+                entry.lemma_ids.len() >= 2,
+                "min_phrase_length=2 should filter single-word phrases, got len={}",
+                entry.lemma_ids.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_max_phrase_length() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let mut cfg = TextRankConfig::default();
+        cfg.max_phrase_length = 1; // Only single-word phrases.
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // All phrases should have at most 1 lemma token.
+        for entry in phrases.entries() {
+            assert!(
+                entry.lemma_ids.len() <= 1,
+                "max_phrase_length=1 should filter multi-word phrases, got len={}",
+                entry.lemma_ids.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_deterministic() {
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases1 = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+        let phrases2 = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert_eq!(phrases1.len(), phrases2.len());
+        for (a, b) in phrases1.entries().iter().zip(phrases2.entries()) {
+            assert_eq!(a.surface, b.surface);
+            assert!((a.score - b.score).abs() < 1e-15);
+            assert_eq!(a.count, b.count);
+        }
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_as_trait_object() {
+        let builder: Box<dyn PhraseBuilder> = Box::new(ChunkPhraseBuilder);
+
+        let tokens = phrase_test_tokens();
+        let (stream, cs, graph, ranks) = build_full_pipeline(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let phrases = builder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(!phrases.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_default() {
+        let _pb = ChunkPhraseBuilder::default();
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_with_personalized_ranks() {
+        // Verify that biasing PageRank towards a specific node changes
+        // the phrase scores — demonstrating that PhraseBuilder correctly
+        // propagates rank differences.
+        let tokens = phrase_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = WordNodeSelector.select(stream.as_ref(), &cfg);
+        let graph = CooccurrenceGraphBuilder::default().build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &cfg,
+        );
+
+        // Standard ranks.
+        let standard_ranks = PageRankRanker.rank(&graph, None, &cfg);
+        let standard_phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &standard_ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Biased ranks: heavily bias node 0.
+        let mut tv = TeleportVector::zeros(graph.num_nodes());
+        if graph.num_nodes() > 0 {
+            tv.set(0, 10.0);
+            for i in 1..graph.num_nodes() {
+                tv.set(i, 1.0);
+            }
+            tv.normalize();
+        }
+        let biased_ranks = PageRankRanker.rank(&graph, Some(&tv), &cfg);
+        let biased_phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &biased_ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Both should produce phrases.
+        assert!(!standard_phrases.is_empty());
+        assert!(!biased_phrases.is_empty());
+
+        // The scores should differ (personalization changes the distribution).
+        // At least one phrase should have a different score.
+        let standard_scores: Vec<f64> = standard_phrases.entries().iter().map(|e| e.score).collect();
+        let biased_scores: Vec<f64> = biased_phrases.entries().iter().map(|e| e.score).collect();
+        let any_different = standard_scores.iter().zip(biased_scores.iter())
+            .any(|(&s, &b)| (s - b).abs() > 1e-10);
+        assert!(
+            any_different || standard_scores.len() != biased_scores.len(),
+            "Personalized ranks should produce different phrase scores"
+        );
+    }
+
+    #[test]
+    fn test_chunk_phrase_builder_cross_sentence_graph() {
+        // Test with SingleRank-style cross-sentence graph to verify
+        // PhraseBuilder works with different graph construction strategies.
+        let tokens = phrase_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = WordNodeSelector.select(stream.as_ref(), &cfg);
+
+        // Cross-sentence graph (SingleRank-style).
+        let graph = CooccurrenceGraphBuilder::single_rank().build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &cfg,
+        );
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = ChunkPhraseBuilder.build(
+            stream.as_ref(),
+            cs.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(
+            !phrases.is_empty(),
+            "ChunkPhraseBuilder should work with cross-sentence graphs"
+        );
     }
 }
