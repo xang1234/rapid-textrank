@@ -1922,6 +1922,529 @@ mod tests {
     }
 
     // ================================================================
+    // Edge correctness — exhaustive verification (textranker-nu7.6)
+    // ================================================================
+
+    /// Collect all undirected edges from a Graph as sorted
+    /// `(lemma_a, lemma_b, weight)` triples (alphabetical order on keys).
+    fn collect_edges(graph: &Graph) -> Vec<(String, String, f64)> {
+        let mut edges = Vec::new();
+        for node in 0..graph.num_nodes() as u32 {
+            let src = graph.lemma(node).to_string();
+            for (nbr, w) in graph.neighbors(node) {
+                let dst = graph.lemma(nbr).to_string();
+                // Deduplicate: only keep the canonical direction.
+                if src < dst {
+                    edges.push((src.clone(), dst, w));
+                }
+            }
+        }
+        edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        edges
+    }
+
+    // ---- Sentence-bounded + binary: complete edge enumeration ----------
+
+    #[test]
+    fn test_edge_correctness_sentence_bounded_binary_two_sentences() {
+        // Sentence 0: A B C  (candidates, all nouns)
+        // Sentence 1: D E    (candidates, all nouns)
+        // window_size = 2 (only +1 offset)
+        //
+        // Expected edges (sentence-bounded, binary):
+        //   Sentence 0: A-B, B-C
+        //   Sentence 1: D-E
+        //   NO cross-sentence edge (C-D must be absent)
+        //   All weights = 1.0
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 0, 2),
+            Token::new("d", "d", PosTag::Noun, 6, 7, 1, 3),
+            Token::new("e", "e", PosTag::Noun, 8, 9, 1, 4),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 5);
+        let edges = collect_edges(&graph);
+        assert_eq!(
+            edges,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("d|NOUN".into(), "e|NOUN".into(), 1.0),
+            ],
+            "Sentence-bounded binary w=2: expected exactly 3 edges"
+        );
+    }
+
+    #[test]
+    fn test_edge_correctness_sentence_bounded_binary_window3() {
+        // Sentence 0: A B C D  (window=3 → offsets +1, +2)
+        //
+        // Expected edges: A-B, A-C, B-C, B-D, C-D  (5 edges)
+        // All weights = 1.0
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 0, 2),
+            Token::new("d", "d", PosTag::Noun, 6, 7, 0, 3),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        let edges = collect_edges(&graph);
+        assert_eq!(
+            edges,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("a|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "d|NOUN".into(), 1.0),
+                ("c|NOUN".into(), "d|NOUN".into(), 1.0),
+            ],
+            "Sentence-bounded binary w=3: expected 5 edges for 4 nodes"
+        );
+    }
+
+    // ---- Cross-sentence + binary: complete edge enumeration ------------
+
+    #[test]
+    fn test_edge_correctness_cross_sentence_binary_two_sentences() {
+        // Same tokens as the sentence-bounded test, but cross-sentence.
+        // Sentence 0: A B C
+        // Sentence 1: D E
+        // window_size = 2 (only +1 offset)
+        //
+        // Cross-sentence ignores sentence boundaries → edges from the
+        // flat sequence [A, B, C, D, E]:
+        //   A-B, B-C, C-D, D-E  (C-D now exists!)
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 0, 2),
+            Token::new("d", "d", PosTag::Noun, 6, 7, 1, 3),
+            Token::new("e", "e", PosTag::Noun, 8, 9, 1, 4),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::CrossSentence { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        let edges = collect_edges(&graph);
+        assert_eq!(
+            edges,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("c|NOUN".into(), "d|NOUN".into(), 1.0),
+                ("d|NOUN".into(), "e|NOUN".into(), 1.0),
+            ],
+            "Cross-sentence binary w=2: expected 4 edges (including C-D)"
+        );
+    }
+
+    // ---- Sentence-bounded + count-accumulating: weight verification ----
+
+    #[test]
+    fn test_edge_correctness_sentence_bounded_count_repeated_pair() {
+        // Sentence 0: A B A B  (window=2)
+        //
+        // Occurrences in order: A(0), B(1), A(2), B(3)
+        // Window pairs (+1 only): (A,B)@0, (B,A)@1, (A,B)@2
+        // All are the same undirected edge A-B → count = 3
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("a", "a", PosTag::Noun, 4, 5, 0, 2),
+            Token::new("b", "b", PosTag::Noun, 6, 7, 0, 3),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 2);
+        let edges = collect_edges(&graph);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, "a|NOUN");
+        assert_eq!(edges[0].1, "b|NOUN");
+        assert!(
+            (edges[0].2 - 3.0).abs() < 1e-10,
+            "Expected weight 3.0 (3 co-occurrences), got {}",
+            edges[0].2
+        );
+    }
+
+    #[test]
+    fn test_edge_correctness_sentence_bounded_count_mixed_pairs() {
+        // Sentence 0: A B C A  (window=3, offsets +1, +2)
+        //
+        // Occurrence sequence: A(0) B(1) C(2) A(3)
+        // Window pairs:
+        //   From A(0): A-B, A-C         (j=0, k=1,2)
+        //   From B(1): B-C, B-A=A-B     (j=1, k=2,3)
+        //   From C(2): C-A=A-C          (j=2, k=3)
+        //   From A(3): (no more tokens)
+        //
+        // Edge weights:
+        //   A-B: 2 (from A(0)->B(1) and B(1)->A(3))
+        //   A-C: 2 (from A(0)->C(2) and C(2)->A(3))
+        //   B-C: 1 (from B(1)->C(2))
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 0, 2),
+            Token::new("a", "a", PosTag::Noun, 6, 7, 0, 3),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 3);
+        let edges = collect_edges(&graph);
+        assert_eq!(
+            edges,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 2.0),
+                ("a|NOUN".into(), "c|NOUN".into(), 2.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+            ],
+            "Sentence-bounded count w=3: A-B=2, A-C=2, B-C=1"
+        );
+    }
+
+    // ---- Cross-sentence + count-accumulating: weight across sentences --
+
+    #[test]
+    fn test_edge_correctness_cross_sentence_count_spanning_boundary() {
+        // Sentence 0: A B
+        // Sentence 1: A B
+        // window_size = 2 (only +1 offset)
+        //
+        // Flat sequence: A(s0) B(s0) A(s1) B(s1)
+        // Window pairs: (A,B)@0, (B,A)@1, (A,B)@2
+        // A-B weight = 3
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("a", "a", PosTag::Noun, 4, 5, 1, 2),
+            Token::new("b", "b", PosTag::Noun, 6, 7, 1, 3),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::CrossSentence { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 2);
+        let edges = collect_edges(&graph);
+        assert_eq!(edges.len(), 1);
+        assert!(
+            (edges[0].2 - 3.0).abs() < 1e-10,
+            "Cross-sentence count: expected 3.0, got {}",
+            edges[0].2
+        );
+    }
+
+    #[test]
+    fn test_edge_correctness_cross_sentence_count_three_distinct() {
+        // Sentence 0: A B
+        // Sentence 1: C
+        // window_size = 3 (offsets +1, +2)
+        //
+        // Flat sequence: A(0) B(1) C(2)
+        // Window pairs: A-B, A-C, B-C  (all weight 1.0)
+        // Cross-sentence makes A-C and B-C possible.
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 1, 2),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::CrossSentence { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        let edges = collect_edges(&graph);
+        assert_eq!(
+            edges,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("a|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+            ],
+            "Cross-sentence count w=3: all 3 distinct pairs, each weight 1.0"
+        );
+    }
+
+    // ---- Sentence-bounded vs cross-sentence comparison -----------------
+
+    #[test]
+    fn test_edge_correctness_bounded_vs_cross_sentence_difference() {
+        // Sentence 0: A B
+        // Sentence 1: C D
+        // window_size = 3
+        //
+        // Sentence-bounded edges: A-B (sent 0), C-D (sent 1) → 2 edges
+        // Cross-sentence edges: A-B, A-C, B-C, B-D, C-D → 5 edges
+        // The difference: cross-sentence gains A-C, B-C, B-D
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("c", "c", PosTag::Noun, 4, 5, 1, 2),
+            Token::new("d", "d", PosTag::Noun, 6, 7, 1, 3),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        // Sentence-bounded
+        let gb_bounded = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let g_bounded = gb_bounded.build(stream.as_ref(), cs.as_ref(), &cfg);
+        let e_bounded = collect_edges(&g_bounded);
+
+        assert_eq!(
+            e_bounded,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("c|NOUN".into(), "d|NOUN".into(), 1.0),
+            ],
+            "Sentence-bounded: only intra-sentence edges"
+        );
+
+        // Cross-sentence
+        let gb_cross = WindowGraphBuilder {
+            window_strategy: WindowStrategy::CrossSentence { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let g_cross = gb_cross.build(stream.as_ref(), cs.as_ref(), &cfg);
+        let e_cross = collect_edges(&g_cross);
+
+        assert_eq!(
+            e_cross,
+            vec![
+                ("a|NOUN".into(), "b|NOUN".into(), 1.0),
+                ("a|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "c|NOUN".into(), 1.0),
+                ("b|NOUN".into(), "d|NOUN".into(), 1.0),
+                ("c|NOUN".into(), "d|NOUN".into(), 1.0),
+            ],
+            "Cross-sentence: gains 3 boundary-spanning edges"
+        );
+    }
+
+    // ---- Binary vs count comparison on the same input ------------------
+
+    #[test]
+    fn test_edge_correctness_binary_vs_count_same_input() {
+        // Sentence 0: A B A (window=2)
+        //
+        // Occurrence pairs: (A,B)@0, (B,A)@1
+        // Binary: A-B weight = 1.0 (set, not accumulated)
+        // Count:  A-B weight = 2.0 (accumulated)
+        let tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("b", "b", PosTag::Noun, 2, 3, 0, 1),
+            Token::new("a", "a", PosTag::Noun, 4, 5, 0, 2),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb_binary = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let g_binary = gb_binary.build(stream.as_ref(), cs.as_ref(), &cfg);
+        let e_binary = collect_edges(&g_binary);
+
+        let gb_count = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 2 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+        let g_count = gb_count.build(stream.as_ref(), cs.as_ref(), &cfg);
+        let e_count = collect_edges(&g_count);
+
+        // Same edge set (just A-B), different weights.
+        assert_eq!(e_binary.len(), 1);
+        assert_eq!(e_count.len(), 1);
+        assert!(
+            (e_binary[0].2 - 1.0).abs() < 1e-10,
+            "Binary: weight should be 1.0, got {}",
+            e_binary[0].2
+        );
+        assert!(
+            (e_count[0].2 - 2.0).abs() < 1e-10,
+            "Count: weight should be 2.0, got {}",
+            e_count[0].2
+        );
+    }
+
+    // ---- Stopwords are excluded from graph (filtered by candidates) ----
+
+    #[test]
+    fn test_edge_correctness_stopwords_not_in_graph() {
+        // Sentence 0: A STOP B  (STOP is a stopword)
+        // window_size = 3
+        //
+        // Candidates: only A and B (STOP is filtered out)
+        // Remaining occurrences: A(0), B(1)
+        // Edge: A-B weight = 1.0
+        let mut tokens = vec![
+            Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
+            Token::new("stop", "stop", PosTag::Noun, 2, 6, 0, 1),
+            Token::new("b", "b", PosTag::Noun, 7, 8, 0, 2),
+        ];
+        tokens[1].is_stopword = true;
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::SentenceBounded { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::Binary,
+        };
+        let graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 2);
+        let edges = collect_edges(&graph);
+        // A and B are adjacent candidates (stopword removed) → one edge.
+        assert_eq!(
+            edges,
+            vec![("a|NOUN".into(), "b|NOUN".into(), 1.0)],
+            "Stopword should be excluded from graph"
+        );
+        // Verify "stop" is not a node.
+        assert!(graph.get_node_by_lemma("stop|NOUN").is_none());
+    }
+
+    // ---- CSR construction determinism ----------------------------------
+
+    #[test]
+    fn test_csr_construction_determinism() {
+        // Build the same graph 50 times and verify identical CSR arrays.
+        // This catches any non-determinism from HashMap iteration order
+        // or unstable sorting.
+        let tokens = vec![
+            Token::new("alpha", "alpha", PosTag::Noun, 0, 5, 0, 0),
+            Token::new("beta", "beta", PosTag::Noun, 6, 10, 0, 1),
+            Token::new("gamma", "gamma", PosTag::Noun, 11, 16, 0, 2),
+            Token::new("delta", "delta", PosTag::Noun, 17, 22, 0, 3),
+            Token::new("epsilon", "epsilon", PosTag::Noun, 23, 30, 1, 4),
+            Token::new("alpha", "alpha", PosTag::Noun, 31, 36, 1, 5),
+            Token::new("beta", "beta", PosTag::Noun, 37, 41, 1, 6),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder {
+            window_strategy: WindowStrategy::CrossSentence { window_size: 3 },
+            edge_weight_policy: EdgeWeightPolicy::CountAccumulating,
+        };
+
+        // Build the reference graph.
+        let ref_graph = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+        let ref_csr = ref_graph.csr();
+        let ref_row_ptr = ref_csr.row_ptr.clone();
+        let ref_col_idx = ref_csr.col_idx.clone();
+        let ref_weights = ref_csr.weights.clone();
+        let ref_lemmas = ref_csr.lemmas.clone();
+
+        // Build 49 more times and compare.
+        for i in 1..50 {
+            let g = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+            let csr = g.csr();
+            assert_eq!(
+                csr.row_ptr, ref_row_ptr,
+                "CSR row_ptr differs on iteration {i}"
+            );
+            assert_eq!(
+                csr.col_idx, ref_col_idx,
+                "CSR col_idx differs on iteration {i}"
+            );
+            assert_eq!(
+                csr.weights, ref_weights,
+                "CSR weights differ on iteration {i}"
+            );
+            assert_eq!(
+                csr.lemmas, ref_lemmas,
+                "CSR lemmas differ on iteration {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_csr_determinism_node_order_stable() {
+        // Verify that node insertion order (and thus CSR row assignment) is
+        // deterministic. Nodes should appear in first-occurrence document
+        // order, not random HashMap order.
+        let tokens = vec![
+            Token::new("zeta", "zeta", PosTag::Noun, 0, 4, 0, 0),
+            Token::new("alpha", "alpha", PosTag::Noun, 5, 10, 0, 1),
+            Token::new("mu", "mu", PosTag::Noun, 11, 13, 0, 2),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let gb = WindowGraphBuilder::default();
+
+        // Build 20 times — node order must always be zeta, alpha, mu
+        // (document order), not alphabetically sorted.
+        for _ in 0..20 {
+            let g = gb.build(stream.as_ref(), cs.as_ref(), &cfg);
+            assert_eq!(g.lemma(0), "zeta|NOUN");
+            assert_eq!(g.lemma(1), "alpha|NOUN");
+            assert_eq!(g.lemma(2), "mu|NOUN");
+        }
+    }
+
+    // ================================================================
     // GraphTransform — NoopGraphTransform tests
     // ================================================================
 
