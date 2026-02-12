@@ -27,8 +27,9 @@ use crate::pipeline::traits::{
     CandidateSelector, ChunkPhraseBuilder, FocusTermsTeleportBuilder, GraphBuilder, GraphTransform,
     NoopGraphTransform, NoopPreprocessor, PageRankRanker, PhraseBuilder, PositionTeleportBuilder,
     Preprocessor, Ranker, ResultFormatter, StandardResultFormatter, TeleportBuilder,
-    UniformTeleportBuilder, WindowGraphBuilder, WordNodeSelector,
+    TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WordNodeSelector,
 };
+use std::collections::HashMap;
 use crate::types::TextRankConfig;
 
 // ---------------------------------------------------------------------------
@@ -219,6 +220,47 @@ impl BiasedTextRankPipeline {
             graph_builder: WindowGraphBuilder::base_textrank(),
             graph_transform: NoopGraphTransform,
             teleport_builder: FocusTermsTeleportBuilder::new(focus_terms, bias_weight),
+            ranker: PageRankRanker,
+            phrase_builder: ChunkPhraseBuilder,
+            formatter: StandardResultFormatter,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopicalPageRankPipeline — topic-weight biased teleportation
+// ---------------------------------------------------------------------------
+
+/// Pipeline alias for TopicalPageRank: SingleRank graph + topic-weighted teleportation.
+///
+/// Uses the same cross-sentence, count-accumulating graph as [`SingleRankPipeline`],
+/// combined with [`TopicWeightsTeleportBuilder`] to bias PageRank towards
+/// topic-relevant candidates.
+pub type TopicalPageRankPipeline = Pipeline<
+    NoopPreprocessor,
+    WordNodeSelector,
+    WindowGraphBuilder,
+    NoopGraphTransform,
+    TopicWeightsTeleportBuilder,
+    PageRankRanker,
+    ChunkPhraseBuilder,
+    StandardResultFormatter,
+>;
+
+impl TopicalPageRankPipeline {
+    /// Build a pipeline for the TopicalPageRank algorithm.
+    ///
+    /// Combines SingleRank's cross-sentence graph with topic-weighted
+    /// teleportation: candidates matching entries in `topic_weights`
+    /// receive proportionally higher teleport probability. Candidates
+    /// absent from the map receive `min_weight`.
+    pub fn topical(topic_weights: HashMap<String, f64>, min_weight: f64) -> Self {
+        Pipeline {
+            preprocessor: NoopPreprocessor,
+            selector: WordNodeSelector,
+            graph_builder: WindowGraphBuilder::single_rank(),
+            graph_transform: NoopGraphTransform,
+            teleport_builder: TopicWeightsTeleportBuilder::new(topic_weights, min_weight),
             ranker: PageRankRanker,
             phrase_builder: ChunkPhraseBuilder,
             formatter: StandardResultFormatter,
@@ -1106,5 +1148,148 @@ mod tests {
             "SingleRank and BaseTextRank produced identical results on multi-sentence input; \
              cross-sentence edges should cause a difference"
         );
+    }
+
+    // ================================================================
+    // TopicalPageRank pipeline tests
+    // ================================================================
+
+    #[test]
+    fn test_topical_pipeline_constructs() {
+        use std::collections::HashMap;
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 2.0);
+        let _pipeline = super::TopicalPageRankPipeline::topical(weights, 0.01);
+    }
+
+    #[test]
+    fn test_topical_pipeline_runs() {
+        use std::collections::HashMap;
+
+        let tokens = golden_tokens();
+        let cfg = TextRankConfig::default();
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 2.0);
+        weights.insert("network".to_string(), 1.5);
+
+        let pipeline = super::TopicalPageRankPipeline::topical(weights, 0.01);
+        let stream = TokenStream::from_tokens(&tokens);
+        let mut obs = StageTimingObserver::new();
+
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        assert!(result.converged);
+        assert!(!result.phrases.is_empty());
+        // Observer should have reports for all 8 stages.
+        assert_eq!(obs.reports().len(), 8);
+    }
+
+    #[test]
+    fn test_topical_pipeline_topic_weights_affect_ranking() {
+        use std::collections::HashMap;
+
+        let tokens = golden_tokens();
+        let cfg = TextRankConfig::default();
+
+        // Run with high weight on "machine".
+        let mut biased_weights = HashMap::new();
+        biased_weights.insert("machine".to_string(), 10.0);
+        let biased_pipeline =
+            super::TopicalPageRankPipeline::topical(biased_weights, 0.01);
+        let biased_result = {
+            let stream = TokenStream::from_tokens(&tokens);
+            let mut obs = NoopObserver;
+            biased_pipeline.run(stream, &cfg, &mut obs)
+        };
+
+        // Run with uniform (all min_weight) — empty map.
+        let uniform_pipeline =
+            super::TopicalPageRankPipeline::topical(HashMap::new(), 1.0);
+        let uniform_result = {
+            let stream = TokenStream::from_tokens(&tokens);
+            let mut obs = NoopObserver;
+            uniform_pipeline.run(stream, &cfg, &mut obs)
+        };
+
+        // Both should produce phrases.
+        assert!(!biased_result.phrases.is_empty());
+        assert!(!uniform_result.phrases.is_empty());
+
+        // Find score of a phrase containing "machine" in both runs.
+        let biased_machine_score = biased_result
+            .phrases
+            .iter()
+            .find(|p| p.lemma.contains("machine"))
+            .map(|p| p.score);
+        let uniform_machine_score = uniform_result
+            .phrases
+            .iter()
+            .find(|p| p.lemma.contains("machine"))
+            .map(|p| p.score);
+
+        // With heavy bias on "machine", its score should be higher
+        // than in the uniform run.
+        assert!(
+            biased_machine_score > uniform_machine_score,
+            "Biased 'machine' score ({:?}) should exceed uniform ({:?})",
+            biased_machine_score,
+            uniform_machine_score
+        );
+    }
+
+    #[test]
+    fn test_topical_pipeline_via_builder() {
+        use crate::pipeline::traits::TopicWeightsTeleportBuilder;
+        use std::collections::HashMap;
+
+        let tokens = golden_tokens();
+        let cfg = TextRankConfig::default();
+
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 2.0);
+        weights.insert("network".to_string(), 1.5);
+
+        // Build via type alias constructor.
+        let alias_result = {
+            let pipeline =
+                super::TopicalPageRankPipeline::topical(weights.clone(), 0.01);
+            let stream = TokenStream::from_tokens(&tokens);
+            let mut obs = NoopObserver;
+            pipeline.run(stream, &cfg, &mut obs)
+        };
+
+        // Build via PipelineBuilder with equivalent stages.
+        let builder_result = {
+            let pipeline = PipelineBuilder::new()
+                .graph_builder(WindowGraphBuilder::single_rank())
+                .teleport_builder(TopicWeightsTeleportBuilder::new(weights, 0.01))
+                .build();
+            let stream = TokenStream::from_tokens(&tokens);
+            let mut obs = NoopObserver;
+            pipeline.run(stream, &cfg, &mut obs)
+        };
+
+        // Both paths must produce identical results.
+        assert_eq!(alias_result.converged, builder_result.converged);
+        assert_eq!(alias_result.iterations, builder_result.iterations);
+        assert_eq!(alias_result.phrases.len(), builder_result.phrases.len());
+
+        let eps = 1e-10;
+        for (i, (a, b)) in alias_result
+            .phrases
+            .iter()
+            .zip(builder_result.phrases.iter())
+            .enumerate()
+        {
+            assert_eq!(a.text, b.text, "Text mismatch at position {i}");
+            assert_eq!(a.lemma, b.lemma, "Lemma mismatch at position {i}");
+            assert!(
+                (a.score - b.score).abs() < eps,
+                "Score mismatch at {i}: alias={:.10}, builder={:.10}",
+                a.score,
+                b.score
+            );
+            assert_eq!(a.rank, b.rank, "Rank mismatch at position {i}");
+        }
     }
 }

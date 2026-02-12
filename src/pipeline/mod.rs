@@ -37,7 +37,7 @@ pub use observer::{
 // Re-export runner types (Pipeline, builder, type alias).
 pub use runner::{
     BaseTextRankPipeline, BiasedTextRankPipeline, Pipeline, PipelineBuilder,
-    PositionRankPipeline, SingleRankPipeline,
+    PositionRankPipeline, SingleRankPipeline, TopicalPageRankPipeline,
 };
 
 // Re-export stage traits and default implementations.
