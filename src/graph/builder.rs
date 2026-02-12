@@ -405,14 +405,26 @@ pub fn build_graph_parallel_with_pos(
         })
         .collect();
 
-    // Merge partial graphs - accumulate weights across sentences
-    let mut builder = GraphBuilder::new();
+    // Merge partial graphs — first accumulate all edge weights, then
+    // create nodes in sorted (deterministic) order so that node IDs are
+    // independent of `FxHashMap` iteration order.
+    let mut merged: FxHashMap<(Arc<str>, Arc<str>), f64> = FxHashMap::default();
     for partial in partial_graphs {
         for ((a, b), weight) in partial {
-            let id_a = builder.get_or_create_node(a.as_ref());
-            let id_b = builder.get_or_create_node(b.as_ref());
-            builder.increment_edge(id_a, id_b, weight);
+            *merged.entry((a, b)).or_insert(0.0) += weight;
         }
+    }
+
+    // Sort edge pairs lexicographically so `get_or_create_node` always
+    // assigns node IDs in the same order regardless of hash seed.
+    let mut sorted_edges: Vec<_> = merged.into_iter().collect();
+    sorted_edges.sort_by(|a, b| (&a.0 .0, &a.0 .1).cmp(&(&b.0 .0, &b.0 .1)));
+
+    let mut builder = GraphBuilder::new();
+    for ((a, b), weight) in sorted_edges {
+        let id_a = builder.get_or_create_node(a.as_ref());
+        let id_b = builder.get_or_create_node(b.as_ref());
+        builder.increment_edge(id_a, id_b, weight);
     }
 
     builder
@@ -491,15 +503,20 @@ fn build_unweighted_parallel(
         })
         .collect();
 
-    // Merge all edge sets - extend automatically handles deduplication
+    // Merge all edge sets — extend automatically handles deduplication.
     let mut merged_edges = FxHashSet::default();
     for partial_set in partial_sets {
         merged_edges.extend(partial_set);
     }
 
-    // Build final graph from unique edges
+    // Sort edge pairs lexicographically so `get_or_create_node` always
+    // assigns node IDs in the same order regardless of hash seed.
+    let mut sorted_edges: Vec<_> = merged_edges.into_iter().collect();
+    sorted_edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+
+    // Build final graph from unique edges in deterministic order.
     let mut builder = GraphBuilder::new();
-    for (a, b) in merged_edges {
+    for (a, b) in sorted_edges {
         let id_a = builder.get_or_create_node(a.as_ref());
         let id_b = builder.get_or_create_node(b.as_ref());
         builder.set_edge(id_a, id_b, 1.0);
@@ -511,6 +528,7 @@ fn build_unweighted_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::csr::CsrGraph;
     use crate::types::PosTag;
 
     fn make_token(text: &str, lemma: &str, sent_idx: usize, tok_idx: usize) -> Token {
@@ -1039,5 +1057,80 @@ mod tests {
             learning_node.edges.contains_key(&deep_id),
             "Parallel builder with boundaries=false should create cross-sentence edges"
         );
+    }
+
+    // ================================================================
+    // CSR / parallel builder determinism tests
+    // ================================================================
+
+    #[test]
+    fn test_parallel_weighted_deterministic_node_order() {
+        // Build a large-enough graph via the parallel weighted path multiple
+        // times. Node IDs (and thus CSR row layout) must be identical.
+        let mut tokens = Vec::with_capacity(1500);
+        for sent_idx in 0..500 {
+            tokens.push(make_token("zeta", "zeta", sent_idx, sent_idx * 3));
+            tokens.push(make_token("alpha", "alpha", sent_idx, sent_idx * 3 + 1));
+            tokens.push(make_token("mu", "mu", sent_idx, sent_idx * 3 + 2));
+        }
+
+        let ref_builder = build_graph_parallel_with_pos(&tokens, 2, true, None, false);
+        let ref_csr = CsrGraph::from_builder(&ref_builder);
+
+        for i in 1..20 {
+            let b = build_graph_parallel_with_pos(&tokens, 2, true, None, false);
+            let csr = CsrGraph::from_builder(&b);
+            assert_eq!(csr.lemmas, ref_csr.lemmas, "lemma order differs on run {i}");
+            assert_eq!(csr.row_ptr, ref_csr.row_ptr, "row_ptr differs on run {i}");
+            assert_eq!(csr.col_idx, ref_csr.col_idx, "col_idx differs on run {i}");
+            assert_eq!(csr.weights, ref_csr.weights, "weights differ on run {i}");
+        }
+    }
+
+    #[test]
+    fn test_parallel_unweighted_deterministic_node_order() {
+        // Same test for the unweighted (binary) parallel path.
+        let mut tokens = Vec::with_capacity(1500);
+        for sent_idx in 0..500 {
+            tokens.push(make_token("zeta", "zeta", sent_idx, sent_idx * 3));
+            tokens.push(make_token("alpha", "alpha", sent_idx, sent_idx * 3 + 1));
+            tokens.push(make_token("mu", "mu", sent_idx, sent_idx * 3 + 2));
+        }
+
+        let ref_builder = build_graph_parallel_with_pos(&tokens, 2, false, None, false);
+        let ref_csr = CsrGraph::from_builder(&ref_builder);
+
+        for i in 1..20 {
+            let b = build_graph_parallel_with_pos(&tokens, 2, false, None, false);
+            let csr = CsrGraph::from_builder(&b);
+            assert_eq!(csr.lemmas, ref_csr.lemmas, "lemma order differs on run {i}");
+            assert_eq!(csr.row_ptr, ref_csr.row_ptr, "row_ptr differs on run {i}");
+            assert_eq!(csr.col_idx, ref_csr.col_idx, "col_idx differs on run {i}");
+            assert_eq!(csr.weights, ref_csr.weights, "weights differ on run {i}");
+        }
+    }
+
+    #[test]
+    fn test_sequential_and_parallel_produce_same_csr() {
+        // Sequential and parallel paths must produce identical CSR output.
+        let mut tokens = Vec::with_capacity(1500);
+        for sent_idx in 0..500 {
+            tokens.push(make_token("alpha", "alpha", sent_idx, sent_idx * 3));
+            tokens.push(make_token("beta", "beta", sent_idx, sent_idx * 3 + 1));
+            tokens.push(make_token("gamma", "gamma", sent_idx, sent_idx * 3 + 2));
+        }
+
+        let seq_builder =
+            GraphBuilder::from_tokens_with_pos(&tokens, 2, true, None, false);
+        let par_builder = build_graph_parallel_with_pos(&tokens, 2, true, None, false);
+
+        let seq_csr = CsrGraph::from_builder(&seq_builder);
+        let par_csr = CsrGraph::from_builder(&par_builder);
+
+        assert_eq!(seq_csr.num_nodes, par_csr.num_nodes);
+        assert_eq!(seq_csr.lemmas, par_csr.lemmas, "node order must match");
+        assert_eq!(seq_csr.row_ptr, par_csr.row_ptr);
+        assert_eq!(seq_csr.col_idx, par_csr.col_idx);
+        assert_eq!(seq_csr.weights, par_csr.weights);
     }
 }
