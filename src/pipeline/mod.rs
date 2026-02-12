@@ -37,7 +37,7 @@ pub use observer::{
 // Re-export runner types (Pipeline, builder, type alias).
 pub use runner::{
     BaseTextRankPipeline, BiasedTextRankPipeline, Pipeline, PipelineBuilder,
-    PositionRankPipeline, SingleRankPipeline, TopicalPageRankPipeline,
+    PositionRankPipeline, SingleRankPipeline, TopicRankPipeline, TopicalPageRankPipeline,
 };
 
 // Re-export stage traits and default implementations.
@@ -47,6 +47,7 @@ pub use traits::{
     GraphTransform, IntraTopicEdgeRemover, JaccardHacClusterer, Linkage, NoopClusterer,
     NoopGraphTransform, NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
     PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, StandardResultFormatter,
-    TeleportBuilder, TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder,
-    WindowStrategy, WordNodeSelector, DEFAULT_WINDOW_SIZE,
+    TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
+    TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
+    WordNodeSelector, DEFAULT_WINDOW_SIZE,
 };

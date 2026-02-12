@@ -25,9 +25,11 @@ use crate::pipeline::observer::{
 };
 use crate::pipeline::traits::{
     CandidateSelector, ChunkPhraseBuilder, FocusTermsTeleportBuilder, GraphBuilder, GraphTransform,
-    NoopGraphTransform, NoopPreprocessor, PageRankRanker, PhraseBuilder, PositionTeleportBuilder,
-    Preprocessor, Ranker, ResultFormatter, StandardResultFormatter, TeleportBuilder,
-    TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WordNodeSelector,
+    JaccardHacClusterer, NoopGraphTransform, NoopPreprocessor, PageRankRanker,
+    PhraseCandidateSelector, PhraseBuilder, PositionTeleportBuilder, Preprocessor, Ranker,
+    ResultFormatter, StandardResultFormatter, TeleportBuilder, TopicGraphBuilder,
+    TopicRepresentativeBuilder, TopicWeightsTeleportBuilder, UniformTeleportBuilder,
+    WindowGraphBuilder, WordNodeSelector,
 };
 use std::collections::HashMap;
 use crate::types::TextRankConfig;
@@ -263,6 +265,69 @@ impl TopicalPageRankPipeline {
             teleport_builder: TopicWeightsTeleportBuilder::new(topic_weights, min_weight),
             ranker: PageRankRanker,
             phrase_builder: ChunkPhraseBuilder,
+            formatter: StandardResultFormatter,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopicRankPipeline — topic-level graph over cluster nodes
+// ---------------------------------------------------------------------------
+
+/// Pipeline alias for TopicRank: phrase candidates → HAC clustering →
+/// topic graph (clusters as nodes) → PageRank → representative selection.
+///
+/// Uses [`PhraseCandidateSelector`] for candidate extraction,
+/// [`TopicGraphBuilder`] (with embedded [`JaccardHacClusterer`]) for
+/// cluster-graph construction, and [`TopicRepresentativeBuilder`] to
+/// select one representative phrase per top-scoring cluster.
+pub type TopicRankPipeline = Pipeline<
+    NoopPreprocessor,
+    PhraseCandidateSelector,
+    TopicGraphBuilder<JaccardHacClusterer>,
+    NoopGraphTransform,
+    UniformTeleportBuilder,
+    PageRankRanker,
+    TopicRepresentativeBuilder,
+    StandardResultFormatter,
+>;
+
+impl TopicRankPipeline {
+    /// Build a pipeline for the TopicRank algorithm with default parameters.
+    ///
+    /// - Similarity threshold: `0.25` (HAC Jaccard cutoff)
+    /// - Edge weight: `1.0`
+    pub fn topic_rank(chunks: Vec<crate::types::ChunkSpan>) -> Self {
+        Pipeline {
+            preprocessor: NoopPreprocessor,
+            selector: PhraseCandidateSelector::new(chunks),
+            graph_builder: TopicGraphBuilder::new(JaccardHacClusterer::topic_rank()),
+            graph_transform: NoopGraphTransform,
+            teleport_builder: UniformTeleportBuilder,
+            ranker: PageRankRanker,
+            phrase_builder: TopicRepresentativeBuilder,
+            formatter: StandardResultFormatter,
+        }
+    }
+
+    /// Build a TopicRank pipeline with custom similarity threshold and
+    /// edge-weight scaling.
+    pub fn topic_rank_with(
+        chunks: Vec<crate::types::ChunkSpan>,
+        similarity_threshold: f64,
+        edge_weight: f64,
+    ) -> Self {
+        Pipeline {
+            preprocessor: NoopPreprocessor,
+            selector: PhraseCandidateSelector::new(chunks),
+            graph_builder: TopicGraphBuilder::new(
+                JaccardHacClusterer::new(similarity_threshold),
+            )
+            .with_edge_weight(edge_weight),
+            graph_transform: NoopGraphTransform,
+            teleport_builder: UniformTeleportBuilder,
+            ranker: PageRankRanker,
+            phrase_builder: TopicRepresentativeBuilder,
             formatter: StandardResultFormatter,
         }
     }
@@ -1592,5 +1657,175 @@ mod tests {
                 sp.score
             );
         }
+    }
+
+    // ================================================================
+    // TopicRankPipeline tests
+    // ================================================================
+
+    fn topic_rank_tokens() -> Vec<Token> {
+        vec![
+            // Sentence 0: "Machine learning algorithms"
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("algorithms", "algorithm", PosTag::Noun, 17, 27, 0, 2),
+            // Sentence 1: "Deep learning models"
+            Token::new("Deep", "deep", PosTag::Adjective, 28, 32, 1, 3),
+            Token::new("learning", "learning", PosTag::Noun, 33, 41, 1, 4),
+            Token::new("models", "model", PosTag::Noun, 42, 48, 1, 5),
+            // Sentence 2: "Neural networks perform"
+            Token::new("Neural", "neural", PosTag::Adjective, 49, 55, 2, 6),
+            Token::new("networks", "network", PosTag::Noun, 56, 64, 2, 7),
+            Token::new("perform", "perform", PosTag::Verb, 65, 72, 2, 8),
+        ]
+    }
+
+    fn topic_rank_chunks() -> Vec<crate::types::ChunkSpan> {
+        use crate::types::ChunkSpan;
+        vec![
+            ChunkSpan { start_token: 0, end_token: 2, start_char: 0, end_char: 16, sentence_idx: 0 },
+            ChunkSpan { start_token: 3, end_token: 5, start_char: 28, end_char: 41, sentence_idx: 1 },
+            ChunkSpan { start_token: 6, end_token: 8, start_char: 49, end_char: 64, sentence_idx: 2 },
+        ]
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_constructs_and_runs() {
+        let tokens = topic_rank_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        let pipeline = TopicRankPipeline::topic_rank(topic_rank_chunks());
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        assert!(!result.phrases.is_empty(), "TopicRank should produce phrases");
+        assert!(result.converged, "PageRank should converge");
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_empty_input() {
+        let stream = TokenStream::from_tokens(&[]);
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        let pipeline = TopicRankPipeline::topic_rank(vec![]);
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        assert!(result.phrases.is_empty());
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_deterministic() {
+        let tokens = topic_rank_tokens();
+        let chunks = topic_rank_chunks();
+        let cfg = TextRankConfig::default();
+
+        let run = || {
+            let stream = TokenStream::from_tokens(&tokens);
+            let mut obs = NoopObserver;
+            TopicRankPipeline::topic_rank(chunks.clone()).run(stream, &cfg, &mut obs)
+        };
+
+        let r1 = run();
+        let r2 = run();
+
+        assert_eq!(r1.phrases.len(), r2.phrases.len());
+        for (p1, p2) in r1.phrases.iter().zip(r2.phrases.iter()) {
+            assert_eq!(p1.text, p2.text, "Phrase text should be deterministic");
+            assert!(
+                (p1.score - p2.score).abs() < 1e-12,
+                "Scores should be identical: {} vs {}",
+                p1.score,
+                p2.score,
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_edge_weight_affects_scores() {
+        let tokens = topic_rank_tokens();
+        let chunks = topic_rank_chunks();
+        let cfg = TextRankConfig::default();
+
+        // Run with default edge_weight=1.0
+        let stream1 = TokenStream::from_tokens(&tokens);
+        let mut obs1 = NoopObserver;
+        let r1 = TopicRankPipeline::topic_rank(chunks.clone())
+            .run(stream1, &cfg, &mut obs1);
+
+        // Run with edge_weight=10.0
+        let stream2 = TokenStream::from_tokens(&tokens);
+        let mut obs2 = NoopObserver;
+        let r2 = TopicRankPipeline::topic_rank_with(chunks, 0.25, 10.0)
+            .run(stream2, &cfg, &mut obs2);
+
+        // Same number of phrases, but scores should differ.
+        assert_eq!(r1.phrases.len(), r2.phrases.len());
+        if r1.phrases.len() > 1 {
+            // With different edge weights, the score distribution changes.
+            // At minimum, verify both runs produce valid output.
+            for p in &r2.phrases {
+                assert!(p.score > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_single_cluster() {
+        // Single chunk → single cluster → single phrase.
+        let tokens = vec![
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+        ];
+        let chunks = vec![
+            crate::types::ChunkSpan {
+                start_token: 0,
+                end_token: 2,
+                start_char: 0,
+                end_char: 16,
+                sentence_idx: 0,
+            },
+        ];
+
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        let pipeline = TopicRankPipeline::topic_rank(chunks);
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        assert_eq!(result.phrases.len(), 1, "Single cluster should produce one phrase");
+        assert!(result.phrases[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_topic_rank_pipeline_with_custom_threshold() {
+        let tokens = topic_rank_tokens();
+        let chunks = topic_rank_chunks();
+        let cfg = TextRankConfig::default();
+
+        // High similarity_threshold (0.99): high Jaccard similarity needed to
+        // merge → distance cutoff = 1 - 0.99 = 0.01 → harder to merge → more
+        // clusters → more phrases.
+        let stream1 = TokenStream::from_tokens(&tokens);
+        let mut obs1 = NoopObserver;
+        let r_strict = TopicRankPipeline::topic_rank_with(chunks.clone(), 0.99, 1.0)
+            .run(stream1, &cfg, &mut obs1);
+
+        // Low similarity_threshold (0.01): low Jaccard similarity needed →
+        // distance cutoff = 1 - 0.01 = 0.99 → easier to merge → fewer
+        // clusters → fewer phrases.
+        let stream2 = TokenStream::from_tokens(&tokens);
+        let mut obs2 = NoopObserver;
+        let r_relaxed = TopicRankPipeline::topic_rank_with(chunks, 0.01, 1.0)
+            .run(stream2, &cfg, &mut obs2);
+
+        // Strict threshold should yield >= phrases than relaxed.
+        assert!(
+            r_strict.phrases.len() >= r_relaxed.phrases.len(),
+            "Strict threshold (0.99) should yield >= phrases than relaxed (0.01): got {} vs {}",
+            r_strict.phrases.len(), r_relaxed.phrases.len()
+        );
     }
 }

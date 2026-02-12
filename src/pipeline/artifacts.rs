@@ -772,6 +772,15 @@ pub struct Graph {
     /// to log whether the graph they see is the original build or a
     /// transformed variant.
     transformed: bool,
+    /// Optional cluster assignments embedded during topic-graph construction.
+    ///
+    /// Present only when the graph was built by [`TopicGraphBuilder`] (or
+    /// another topic-family graph builder).  The downstream
+    /// [`TopicRepresentativeBuilder`] reads this to select one representative
+    /// phrase per cluster.
+    ///
+    /// `None` for all non-topic pipelines — zero overhead.
+    cluster_assignments: Option<ClusterAssignments>,
 }
 
 impl Graph {
@@ -789,6 +798,7 @@ impl Graph {
                 lemma_to_id: Default::default(),
             },
             transformed: false,
+            cluster_assignments: None,
         }
     }
 
@@ -801,6 +811,7 @@ impl Graph {
         Self {
             csr: crate::graph::csr::CsrGraph::from_builder(builder),
             transformed: false,
+            cluster_assignments: None,
         }
     }
 
@@ -809,6 +820,7 @@ impl Graph {
         Self {
             csr,
             transformed: false,
+            cluster_assignments: None,
         }
     }
 
@@ -848,6 +860,25 @@ impl Graph {
     #[inline]
     pub fn set_transformed(&mut self) {
         self.transformed = true;
+    }
+
+    /// Access the embedded cluster assignments (if any).
+    ///
+    /// Returns `Some` only when this graph was built by a topic-family
+    /// graph builder (e.g., [`TopicGraphBuilder`]).
+    #[inline]
+    pub fn cluster_assignments(&self) -> Option<&ClusterAssignments> {
+        self.cluster_assignments.as_ref()
+    }
+
+    /// Attach cluster assignments to this graph.
+    ///
+    /// Called by topic-family graph builders after constructing the cluster
+    /// graph so downstream stages (e.g., [`TopicRepresentativeBuilder`])
+    /// can access them.
+    #[inline]
+    pub fn set_cluster_assignments(&mut self, assignments: ClusterAssignments) {
+        self.cluster_assignments = Some(assignments);
     }
 
     // ------------------------------------------------------------------

@@ -6,8 +6,8 @@
 
 use crate::pipeline::artifacts::{
     CandidateKind, CandidateSet, CandidateSetRef, ClusterAssignments, DebugPayload,
-    FormattedResult, Graph, PhraseCandidate, PhraseSet, RankOutput, TeleportType, TeleportVector,
-    TokenStream, TokenStreamRef, WordCandidate,
+    FormattedResult, Graph, PhraseCandidate, PhraseEntry, PhraseSet, RankOutput, TeleportType,
+    TeleportVector, TokenStream, TokenStreamRef, WordCandidate,
 };
 use crate::types::{ChunkSpan, PosTag, TextRankConfig};
 use serde::{Deserialize, Serialize};
@@ -1532,6 +1532,291 @@ impl PhraseBuilder for ChunkPhraseBuilder {
         // Convert back to pipeline artifact.
         let mut pool = StringPool::new();
         PhraseSet::from_phrases(&phrases, &mut pool)
+    }
+}
+
+// ============================================================================
+// TopicGraphBuilder — cluster graph for TopicRank (stage 2, topic family)
+// ============================================================================
+
+/// Builds a complete topic-level graph where **nodes are clusters** (not
+/// individual words).
+///
+/// The construction pipeline for TopicRank differs fundamentally from the
+/// word-graph family:
+///
+/// 1. Run the embedded [`Clusterer`] on phrase candidates →
+///    [`ClusterAssignments`].
+/// 2. Collect cluster members as `Vec<Vec<usize>>`.
+/// 3. Build a complete graph: for each cluster pair `(i, j)`, weight =
+///    `Σ(1 / compute_gap(a, b))` × `edge_weight`.
+/// 4. Convert to the pipeline [`Graph`] artifact (CSR-backed) and attach
+///    the cluster assignments.
+///
+/// The embedded cluster assignments are later consumed by
+/// [`TopicRepresentativeBuilder`] to select one representative phrase per
+/// cluster.
+///
+/// # Type parameter
+///
+/// - `C`: the clustering implementation — defaults to
+///   [`JaccardHacClusterer`] (HAC with average linkage over Jaccard
+///   distance).
+///
+/// # Construction
+///
+/// - [`TopicGraphBuilder::new`] — default `edge_weight = 1.0`.
+/// - [`TopicGraphBuilder::with_edge_weight`] — custom scaling.
+#[derive(Debug, Clone)]
+pub struct TopicGraphBuilder<C = JaccardHacClusterer> {
+    /// Clustering algorithm.
+    clusterer: C,
+    /// Multiplicative scaling factor for topic-graph edge weights.
+    edge_weight: f64,
+}
+
+impl<C: Clusterer> TopicGraphBuilder<C> {
+    /// Create with the given clusterer and default `edge_weight = 1.0`.
+    pub fn new(clusterer: C) -> Self {
+        Self {
+            clusterer,
+            edge_weight: 1.0,
+        }
+    }
+
+    /// Override the edge-weight scaling factor.
+    pub fn with_edge_weight(mut self, weight: f64) -> Self {
+        self.edge_weight = weight.max(0.0);
+        self
+    }
+}
+
+impl<C: Clusterer> GraphBuilder for TopicGraphBuilder<C> {
+    fn build(
+        &self,
+        _tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        cfg: &TextRankConfig,
+    ) -> Graph {
+        use crate::clustering::compute_gap;
+        use crate::types::ChunkSpan;
+
+        // --- 1. Cluster phrase candidates ---
+        let assignments = self.clusterer.cluster(candidates, cfg);
+
+        let phrases = candidates.phrases();
+        if phrases.is_empty() || assignments.num_clusters() == 0 {
+            return Graph::empty();
+        }
+
+        let num_clusters = assignments.num_clusters() as usize;
+
+        // --- 2. Collect cluster members ---
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); num_clusters];
+        for (cand_idx, &cluster_id) in assignments.as_slice().iter().enumerate() {
+            members[cluster_id as usize].push(cand_idx);
+        }
+
+        // --- 3. Build complete graph with inverse-distance weights ---
+        let mut builder = crate::graph::builder::GraphBuilder::with_capacity(num_clusters);
+        for i in 0..num_clusters {
+            builder.get_or_create_node(&format!("cluster_{}", i));
+        }
+
+        for i in 0..num_clusters {
+            for j in (i + 1)..num_clusters {
+                let mut weight = 0.0;
+                for &src in &members[i] {
+                    for &tgt in &members[j] {
+                        let gap = compute_gap(
+                            &ChunkSpan {
+                                start_token: phrases[src].start_token as usize,
+                                end_token: phrases[src].end_token as usize,
+                                start_char: phrases[src].start_char as usize,
+                                end_char: phrases[src].end_char as usize,
+                                sentence_idx: phrases[src].sentence_idx as usize,
+                            },
+                            &ChunkSpan {
+                                start_token: phrases[tgt].start_token as usize,
+                                end_token: phrases[tgt].end_token as usize,
+                                start_char: phrases[tgt].start_char as usize,
+                                end_char: phrases[tgt].end_char as usize,
+                                sentence_idx: phrases[tgt].sentence_idx as usize,
+                            },
+                        );
+                        weight += 1.0 / gap as f64;
+                    }
+                }
+                if weight > 0.0 {
+                    builder.increment_edge(i as u32, j as u32, weight * self.edge_weight);
+                }
+            }
+        }
+
+        // --- 4. Wrap and attach assignments ---
+        let mut graph = Graph::from_builder(&builder);
+        graph.set_cluster_assignments(assignments);
+        graph
+    }
+}
+
+// ============================================================================
+// TopicRepresentativeBuilder — select one phrase per cluster (stage 6, topic)
+// ============================================================================
+
+/// Selects the first-occurring phrase from each cluster as its
+/// representative, using the cluster's PageRank score.
+///
+/// This is the [`PhraseBuilder`] implementation for TopicRank.  It reads
+/// the [`ClusterAssignments`] embedded in the [`Graph`] artifact and:
+///
+/// 1. For each cluster, picks the candidate with the lowest `start_token`
+///    (first occurrence in the document).
+/// 2. Materializes the phrase text and lemma from the [`TokenStreamRef`].
+/// 3. Collects token-span offsets from **all** cluster members.
+/// 4. Sorts by score descending, with deterministic tie-breakers (position
+///    ascending, lemma ascending).
+/// 5. Truncates to `cfg.top_n`.
+///
+/// # Panics
+///
+/// Panics if `graph.cluster_assignments()` is `None` — this indicates a
+/// pipeline wiring bug (TopicRepresentativeBuilder should only be paired
+/// with TopicGraphBuilder).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TopicRepresentativeBuilder;
+
+/// Materialize the surface-form text for a phrase candidate by joining
+/// the token texts with spaces.
+fn materialize_phrase_text(tokens: TokenStreamRef<'_>, phrase: &PhraseCandidate) -> String {
+    let start = phrase.start_token as usize;
+    let end = phrase.end_token as usize;
+    tokens.tokens()[start..end]
+        .iter()
+        .map(|e| tokens.text(e))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Materialize the lemma text for a phrase candidate by joining the
+/// token lemmas with spaces.
+fn materialize_phrase_lemma(tokens: TokenStreamRef<'_>, phrase: &PhraseCandidate) -> String {
+    let start = phrase.start_token as usize;
+    let end = phrase.end_token as usize;
+    tokens.tokens()[start..end]
+        .iter()
+        .map(|e| tokens.lemma(e))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl PhraseBuilder for TopicRepresentativeBuilder {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        ranks: &RankOutput,
+        graph: &Graph,
+        cfg: &TextRankConfig,
+    ) -> PhraseSet {
+        let assignments = match graph.cluster_assignments() {
+            Some(a) => a,
+            None => {
+                // No cluster assignments — either the graph is empty (valid for
+                // zero candidates) or a pipeline wiring bug.  If we have
+                // candidates but no assignments, that's the bug.
+                if !candidates.is_empty() {
+                    panic!(
+                        "TopicRepresentativeBuilder requires cluster_assignments in Graph \
+                         (wiring bug: {} candidates but no assignments)",
+                        candidates.len()
+                    );
+                }
+                return PhraseSet::empty();
+            }
+        };
+
+        let phrases = candidates.phrases();
+        if phrases.is_empty() || assignments.num_clusters() == 0 {
+            return PhraseSet::empty();
+        }
+
+        let num_clusters = assignments.num_clusters() as usize;
+
+        // --- 1. Collect cluster members ---
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); num_clusters];
+        for (cand_idx, &cluster_id) in assignments.as_slice().iter().enumerate() {
+            members[cluster_id as usize].push(cand_idx);
+        }
+
+        // --- 2. Build phrase entries ---
+        let mut entries: Vec<PhraseEntry> = Vec::with_capacity(num_clusters);
+
+        for (cluster_idx, cluster_members) in members.iter().enumerate() {
+            if cluster_members.is_empty() {
+                continue;
+            }
+
+            // Get the cluster's PageRank score.
+            let score = ranks.score(cluster_idx as u32);
+
+            // Select representative: first-occurring candidate (min start_token).
+            let &best_idx = cluster_members
+                .iter()
+                .min_by_key(|&&idx| phrases[idx].start_token)
+                .unwrap();
+
+            let representative = &phrases[best_idx];
+
+            // Materialize text and lemma from the token stream.
+            let surface = materialize_phrase_text(tokens, representative);
+            let lemma_text = materialize_phrase_lemma(tokens, representative);
+
+            // Collect offsets from all cluster members, sorted by position.
+            let mut spans: Vec<(u32, u32)> = cluster_members
+                .iter()
+                .map(|&idx| (phrases[idx].start_token, phrases[idx].end_token))
+                .collect();
+            spans.sort_by_key(|(start, _)| *start);
+
+            // Intern lemma IDs for the representative.
+            let lemma_ids = representative.lemma_ids.clone();
+
+            entries.push(PhraseEntry {
+                lemma_ids,
+                score,
+                count: cluster_members.len() as u32,
+                surface: Some(surface),
+                lemma_text: Some(lemma_text),
+                spans: Some(spans),
+            });
+        }
+
+        // --- 3. Sort by score descending with deterministic tie-breakers ---
+        entries.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Tie-breaker 1: earlier position first.
+                .then_with(|| {
+                    let a_pos = a.spans.as_ref().and_then(|s: &Vec<(u32, u32)>| s.first().map(|p| p.0)).unwrap_or(u32::MAX);
+                    let b_pos = b.spans.as_ref().and_then(|s: &Vec<(u32, u32)>| s.first().map(|p| p.0)).unwrap_or(u32::MAX);
+                    a_pos.cmp(&b_pos)
+                })
+                // Tie-breaker 2: lemma text ascending.
+                .then_with(|| {
+                    let a_lemma = a.lemma_text.as_deref().unwrap_or("");
+                    let b_lemma = b.lemma_text.as_deref().unwrap_or("");
+                    a_lemma.cmp(b_lemma)
+                })
+        });
+
+        // --- 4. Truncate to top_n ---
+        if cfg.top_n > 0 && entries.len() > cfg.top_n {
+            entries.truncate(cfg.top_n);
+        }
+
+        PhraseSet::from_entries(entries)
     }
 }
 
@@ -5780,5 +6065,229 @@ mod tests {
         assert_eq!(p, EdgeWeightPolicy::Binary);
         assert!(p.is_binary());
         assert!(!p.is_count_accumulating());
+    }
+
+    // ================================================================
+    // TopicGraphBuilder tests
+    // ================================================================
+
+    /// Build phrase candidates and chunks for topic graph tests.
+    ///
+    /// Creates three distinct phrases across two sentences:
+    /// - "machine learning" (sentence 0, tokens 0-1)
+    /// - "deep learning"    (sentence 1, tokens 3-4)
+    /// - "neural networks"  (sentence 2, tokens 6-7)
+    fn topic_test_tokens() -> Vec<Token> {
+        vec![
+            // Sentence 0
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("is", "be", PosTag::Verb, 17, 19, 0, 2),
+            // Sentence 1
+            Token::new("Deep", "deep", PosTag::Adjective, 20, 24, 1, 3),
+            Token::new("learning", "learning", PosTag::Noun, 25, 33, 1, 4),
+            Token::new("models", "model", PosTag::Noun, 34, 40, 1, 5),
+            // Sentence 2
+            Token::new("Neural", "neural", PosTag::Adjective, 41, 47, 2, 6),
+            Token::new("networks", "network", PosTag::Noun, 48, 56, 2, 7),
+        ]
+    }
+
+    fn topic_test_chunks() -> Vec<ChunkSpan> {
+        vec![
+            ChunkSpan { start_token: 0, end_token: 2, start_char: 0, end_char: 16, sentence_idx: 0 },
+            ChunkSpan { start_token: 3, end_token: 5, start_char: 20, end_char: 33, sentence_idx: 1 },
+            ChunkSpan { start_token: 6, end_token: 8, start_char: 41, end_char: 56, sentence_idx: 2 },
+        ]
+    }
+
+    #[test]
+    fn test_topic_graph_builder_empty_candidates() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let empty_sel = PhraseCandidateSelector::new(vec![]);
+        let cfg = TextRankConfig::default();
+        let candidates = empty_sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        assert!(graph.is_empty());
+        assert!(graph.cluster_assignments().is_none());
+    }
+
+    #[test]
+    fn test_topic_graph_builder_single_candidate() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let sel = PhraseCandidateSelector::new(vec![topic_test_chunks()[0].clone()]);
+        let cfg = TextRankConfig::default();
+        let candidates = sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        // Single candidate → 1 cluster → 1 node, 0 edges.
+        assert_eq!(graph.num_nodes(), 1);
+        assert_eq!(graph.num_edges(), 0);
+        assert!(graph.cluster_assignments().is_some());
+        assert_eq!(graph.cluster_assignments().unwrap().num_clusters(), 1);
+    }
+
+    #[test]
+    fn test_topic_graph_builder_cluster_graph_structure() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let sel = PhraseCandidateSelector::new(topic_test_chunks());
+        let cfg = TextRankConfig::default();
+        let candidates = sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        // With threshold=0.25, "machine learning" and "deep learning"
+        // share "learning", so they may cluster. "neural networks" is
+        // disjoint. Regardless of clustering, the graph should have nodes
+        // and edges.
+        assert!(graph.num_nodes() > 0);
+        assert!(graph.cluster_assignments().is_some());
+
+        let assignments = graph.cluster_assignments().unwrap();
+        assert_eq!(assignments.num_candidates(), 3);
+    }
+
+    #[test]
+    fn test_topic_graph_builder_edge_weight_multiplier() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let chunks = topic_test_chunks();
+        let cfg = TextRankConfig::default();
+
+        let sel1 = PhraseCandidateSelector::new(chunks.clone());
+        let cands1 = sel1.select(stream.as_ref(), &cfg);
+        let g1 = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank())
+            .build(stream.as_ref(), cands1.as_ref(), &cfg);
+
+        let sel2 = PhraseCandidateSelector::new(chunks);
+        let cands2 = sel2.select(stream.as_ref(), &cfg);
+        let g2 = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank())
+            .with_edge_weight(2.0)
+            .build(stream.as_ref(), cands2.as_ref(), &cfg);
+
+        // Both graphs should have the same structure.
+        assert_eq!(g1.num_nodes(), g2.num_nodes());
+
+        // If there are any edges, the 2x graph should have double the weights.
+        if g1.num_edges() > 0 {
+            let w1_total: f64 = g1.csr().weights.iter().sum();
+            let w2_total: f64 = g2.csr().weights.iter().sum();
+            let ratio = w2_total / w1_total;
+            assert!(
+                (ratio - 2.0).abs() < 1e-6,
+                "Edge weight 2.0 should double total weight: ratio={ratio}"
+            );
+        }
+    }
+
+    // ================================================================
+    // TopicRepresentativeBuilder tests
+    // ================================================================
+
+    #[test]
+    fn test_topic_representative_selects_first_occurrence() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let sel = PhraseCandidateSelector::new(topic_test_chunks());
+        let cfg = TextRankConfig::default();
+        let candidates = sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+        let ranker = PageRankRanker;
+        let ranks = ranker.rank(&graph, None, &cfg);
+
+        let phrases = TopicRepresentativeBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(!phrases.is_empty());
+
+        // Every phrase should have a surface form.
+        for entry in phrases.entries() {
+            assert!(entry.surface.is_some());
+            assert!(entry.lemma_text.is_some());
+            assert!(entry.score > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_topic_representative_collects_all_offsets() {
+        // Use two identical phrases that should cluster together.
+        let tokens = vec![
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("Machine", "machine", PosTag::Noun, 17, 24, 1, 2),
+            Token::new("learning", "learning", PosTag::Noun, 25, 33, 1, 3),
+        ];
+        let chunks = vec![
+            ChunkSpan { start_token: 0, end_token: 2, start_char: 0, end_char: 16, sentence_idx: 0 },
+            ChunkSpan { start_token: 2, end_token: 4, start_char: 17, end_char: 33, sentence_idx: 1 },
+        ];
+
+        let stream = TokenStream::from_tokens(&tokens);
+        let sel = PhraseCandidateSelector::new(chunks);
+        let cfg = TextRankConfig::default();
+        let candidates = sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = TopicRepresentativeBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // Identical phrases cluster into 1 cluster → 1 phrase.
+        assert_eq!(phrases.len(), 1);
+
+        // Should have 2 offsets (both occurrences).
+        let entry = &phrases.entries()[0];
+        assert_eq!(entry.count, 2);
+        let spans = entry.spans.as_ref().unwrap();
+        assert_eq!(spans.len(), 2);
+        // First occurrence should be listed first.
+        assert!(spans[0].0 <= spans[1].0);
+    }
+
+    #[test]
+    fn test_topic_representative_respects_top_n() {
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let sel = PhraseCandidateSelector::new(topic_test_chunks());
+        let cfg = TextRankConfig::default().with_top_n(1);
+        let candidates = sel.select(stream.as_ref(), &cfg);
+
+        let builder = TopicGraphBuilder::new(JaccardHacClusterer::topic_rank());
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = TopicRepresentativeBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        // top_n=1 → at most 1 phrase.
+        assert!(phrases.len() <= 1);
     }
 }
