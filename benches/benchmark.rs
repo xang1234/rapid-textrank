@@ -292,6 +292,75 @@ fn benchmark_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_pipeline_vs_direct(c: &mut Criterion) {
+    let tokenizer = nlp::tokenizer::Tokenizer::new();
+    let (_, mut tokens) = tokenizer.tokenize(SAMPLE_TEXT);
+
+    let stopwords = nlp::stopwords::StopwordFilter::new("en");
+    for token in &mut tokens {
+        token.is_stopword = stopwords.is_stopword(&token.text);
+    }
+
+    let config = TextRankConfig::default().with_top_n(10);
+
+    // Micro-benchmark: TokenStream construction overhead
+    c.bench_function("pipeline_overhead/token_stream", |b| {
+        b.iter(|| pipeline::TokenStream::from_tokens(black_box(&tokens)))
+    });
+
+    let mut group = c.benchmark_group("pipeline_vs_direct");
+
+    // New pipeline-based path (current implementation)
+    group.bench_function("pipeline", |b| {
+        b.iter(|| {
+            phrase::extraction::extract_keyphrases_with_info(
+                black_box(&tokens),
+                black_box(&config),
+            )
+        })
+    });
+
+    // Old direct path (pre-migration, inlined for comparison)
+    group.bench_function("direct", |b| {
+        b.iter(|| {
+            let include_pos = if config.include_pos.is_empty() {
+                None
+            } else {
+                Some(config.include_pos.as_slice())
+            };
+            let builder = graph::builder::GraphBuilder::from_tokens_with_pos(
+                black_box(&tokens),
+                config.window_size,
+                config.use_edge_weights,
+                include_pos,
+                config.use_pos_in_nodes,
+            );
+            if builder.is_empty() {
+                return phrase::extraction::ExtractionResult {
+                    phrases: Vec::new(),
+                    converged: true,
+                    iterations: 0,
+                };
+            }
+            let graph = graph::csr::CsrGraph::from_builder(&builder);
+            let pagerank = pagerank::standard::StandardPageRank::new()
+                .with_damping(config.damping)
+                .with_max_iterations(config.max_iterations)
+                .with_threshold(config.convergence_threshold)
+                .run(&graph);
+            let extractor = PhraseExtractor::with_config(config.clone());
+            let phrases = extractor.extract(black_box(&tokens), &graph, &pagerank);
+            phrase::extraction::ExtractionResult {
+                phrases,
+                converged: pagerank.converged,
+                iterations: pagerank.iterations,
+            }
+        })
+    });
+
+    group.finish();
+}
+
 fn benchmark_stopwords(c: &mut Criterion) {
     let filter = nlp::stopwords::StopwordFilter::new("en");
 
@@ -330,6 +399,7 @@ criterion_group!(
     benchmark_pagerank,
     benchmark_phrase_extraction,
     benchmark_full_pipeline,
+    benchmark_pipeline_vs_direct,
     benchmark_stopwords,
 );
 

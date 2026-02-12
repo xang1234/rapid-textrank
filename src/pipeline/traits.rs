@@ -328,8 +328,6 @@ impl GraphBuilder for CooccurrenceGraphBuilder {
         candidates: CandidateSetRef<'_>,
         cfg: &TextRankConfig,
     ) -> Graph {
-        use rustc_hash::FxHashSet;
-
         // Only word-level candidates produce co-occurrence graphs.
         // Phrase-level candidates use topic-graph construction (TopicRank).
         let words = match candidates.kind() {
@@ -342,22 +340,26 @@ impl GraphBuilder for CooccurrenceGraphBuilder {
             }
         };
 
-        // Build a fast membership set from the candidate words.
-        // Key: (lemma_id, optional POS discriminant).
-        let valid_keys: FxHashSet<(u32, Option<PosTag>)> = words
+        // Pre-compute graph key strings once per unique candidate.
+        // This avoids repeated `format!("{}|{}", lemma, pos)` allocations
+        // for every token occurrence.
+        use rustc_hash::FxHashMap;
+        let key_strings: FxHashMap<(u32, Option<PosTag>), String> = words
             .iter()
             .map(|w| {
-                if cfg.use_pos_in_nodes {
+                let lookup = if cfg.use_pos_in_nodes {
                     (w.lemma_id, Some(w.pos))
                 } else {
                     (w.lemma_id, None)
-                }
+                };
+                let gk = w.graph_key(tokens.pool(), cfg.use_pos_in_nodes);
+                (lookup, gk)
             })
             .collect();
 
         // Collect candidate token occurrences in document order with graph
         // keys and sentence indices for windowing.
-        let mut occurrences: Vec<(u32, String)> = Vec::new(); // (sentence_idx, graph_key)
+        let mut occurrences: Vec<(u32, &str)> = Vec::new();
 
         for entry in tokens.tokens() {
             let key = if cfg.use_pos_in_nodes {
@@ -365,14 +367,13 @@ impl GraphBuilder for CooccurrenceGraphBuilder {
             } else {
                 (entry.lemma_id, None)
             };
-            if valid_keys.contains(&key) {
-                let graph_key = entry.graph_key(tokens.pool(), cfg.use_pos_in_nodes);
-                occurrences.push((entry.sentence_idx, graph_key));
+            if let Some(gk) = key_strings.get(&key) {
+                occurrences.push((entry.sentence_idx, gk.as_str()));
             }
         }
 
         // Build edges via the mutable GraphBuilder.
-        let mut builder = crate::graph::builder::GraphBuilder::with_capacity(valid_keys.len());
+        let mut builder = crate::graph::builder::GraphBuilder::with_capacity(key_strings.len());
 
         match self.window_strategy {
             WindowStrategy::SentenceBounded => {

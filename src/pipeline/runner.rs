@@ -17,9 +17,7 @@
 //! Use [`Pipeline::base_textrank()`] (and friends) to build pipelines for
 //! known algorithm variants without spelling out the generics manually.
 
-use crate::pipeline::artifacts::{
-    CandidateSet, FormattedResult, Graph, PhraseSet, RankOutput, TokenStream,
-};
+use crate::pipeline::artifacts::{FormattedResult, TokenStream};
 use crate::pipeline::observer::{
     PipelineObserver, StageClock, StageReport, StageReportBuilder, STAGE_CANDIDATES, STAGE_FORMAT,
     STAGE_GRAPH, STAGE_GRAPH_TRANSFORM, STAGE_PHRASES, STAGE_PREPROCESS, STAGE_RANK,
@@ -428,6 +426,7 @@ impl<Pre, Sel, GB, GT, TB, Rnk, PB, Fmt> PipelineBuilder<Pre, Sel, GB, GT, TB, R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::artifacts::{CandidateSet, Graph, PhraseSet, RankOutput};
     use crate::pipeline::observer::{NoopObserver, StageTimingObserver};
     use crate::types::{PosTag, Token};
 

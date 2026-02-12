@@ -111,13 +111,9 @@ impl TokenStream {
             };
         }
 
-        // Determine number of sentences for offset pre-allocation.
-        let num_sentences = tokens
-            .iter()
-            .map(|t| t.sentence_idx)
-            .max()
-            .map_or(0, |m| m + 1);
-        // +1 for the sentinel entry at the end.
+        // Tokens are in document order, so the last token has the highest
+        // sentence index — O(1) instead of a full scan.
+        let num_sentences = tokens.last().map_or(0, |t| t.sentence_idx + 1);
         let mut sentence_offsets = Vec::with_capacity(num_sentences + 1);
 
         let mut current_sentence: usize = 0;
@@ -1077,6 +1073,18 @@ impl RankOutput {
     pub fn to_pagerank_result(&self) -> crate::pagerank::PageRankResult {
         crate::pagerank::PageRankResult {
             scores: self.scores.clone(),
+            iterations: self.iterations as usize,
+            delta: self.final_delta,
+            converged: self.converged,
+        }
+    }
+
+    /// Consuming conversion to the legacy [`PageRankResult`] type.
+    ///
+    /// Moves the score vector instead of cloning, avoiding allocation.
+    pub fn into_pagerank_result(self) -> crate::pagerank::PageRankResult {
+        crate::pagerank::PageRankResult {
+            scores: self.scores,
             iterations: self.iterations as usize,
             delta: self.final_delta,
             converged: self.converged,

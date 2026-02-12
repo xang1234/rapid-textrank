@@ -227,47 +227,63 @@ pub fn extract_keyphrases(tokens: &[Token], config: &TextRankConfig) -> Vec<Phra
 
 /// Extract phrases with PageRank convergence information.
 ///
-/// Internally delegates to the modular pipeline ([`Pipeline`]) with the
-/// default BaseTextRank stage composition:
+/// Uses a hybrid approach for optimal performance:
 ///
-/// 1. Word-level candidate selection (POS + stopword filtering)
-/// 2. Sentence-bounded co-occurrence graph
-/// 3. Standard PageRank
-/// 4. Chunk-based phrase extraction
-/// 5. Standard result formatting
+/// 1. Fused candidate selection + graph building via legacy
+///    [`GraphBuilder::from_tokens_with_pos`] (avoids `TokenStream` interning)
+/// 2. [`PageRankRanker`] pipeline stage for ranking
+/// 3. Direct [`PhraseExtractor`] invocation (avoids `to_legacy_tokens()` round-trip)
 ///
 /// The `use_edge_weights` config field controls edge weight policy:
 /// `true` → count-accumulating, `false` → binary.
 ///
-/// [`Pipeline`]: crate::pipeline::Pipeline
+/// [`GraphBuilder::from_tokens_with_pos`]: crate::graph::builder::GraphBuilder::from_tokens_with_pos
+/// [`PageRankRanker`]: crate::pipeline::PageRankRanker
 pub fn extract_keyphrases_with_info(tokens: &[Token], config: &TextRankConfig) -> ExtractionResult {
-    use crate::pipeline::{
-        CooccurrenceGraphBuilder, EdgeWeightPolicy, NoopObserver, PipelineBuilder, TokenStream,
-        WindowStrategy,
+    use crate::graph::builder::GraphBuilder;
+    use crate::pipeline::{Graph, Ranker};
+
+    // Stage 1+2: fused candidate selection + graph building.
+    // Bypasses TokenStream interning for zero-copy token access.
+    let include_pos = if config.include_pos.is_empty() {
+        None
+    } else {
+        Some(config.include_pos.as_slice())
     };
+    let builder = GraphBuilder::from_tokens_with_pos(
+        tokens,
+        config.window_size,
+        config.use_edge_weights,
+        include_pos,
+        config.use_pos_in_nodes,
+    );
 
-    let stream = TokenStream::from_tokens(tokens);
+    if builder.is_empty() {
+        return ExtractionResult {
+            phrases: Vec::new(),
+            converged: true,
+            iterations: 0,
+        };
+    }
 
-    let graph_builder = CooccurrenceGraphBuilder {
-        window_strategy: WindowStrategy::SentenceBounded,
-        edge_weight_policy: if config.use_edge_weights {
-            EdgeWeightPolicy::Count
-        } else {
-            EdgeWeightPolicy::Binary
-        },
-    };
+    // Wrap in pipeline artifact for stage interop.
+    let graph = Graph::from_builder(&builder);
 
-    let pipeline = PipelineBuilder::new()
-        .graph_builder(graph_builder)
-        .build();
+    // Stage 3: ranking via pipeline stage.
+    let rank_output = crate::pipeline::PageRankRanker.rank(&graph, None, config);
+    let converged = rank_output.converged();
+    let iterations = rank_output.iterations() as usize;
 
-    let mut observer = NoopObserver;
-    let result = pipeline.run(stream, config, &mut observer);
+    // Stage 4: phrase extraction — use original &[Token] directly,
+    // avoiding the to_legacy_tokens() round-trip.
+    let pagerank_result = rank_output.into_pagerank_result();
+    let extractor = PhraseExtractor::with_config(config.clone());
+    let phrases = extractor.extract(tokens, graph.csr(), &pagerank_result);
 
     ExtractionResult {
-        phrases: result.phrases,
-        converged: result.converged,
-        iterations: result.iterations as usize,
+        phrases,
+        converged,
+        iterations,
     }
 }
 
