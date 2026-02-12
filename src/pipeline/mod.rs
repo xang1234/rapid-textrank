@@ -44,6 +44,7 @@ pub use runner::{
 pub use traits::{
     CandidateSelector, ChunkPhraseBuilder, CooccurrenceGraphBuilder, EdgeWeightPolicy,
     FocusTermsTeleportBuilder, GraphBuilder, GraphTransform, NoopGraphTransform,
+    TopicWeightsTeleportBuilder,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
     PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, StandardResultFormatter,
     TeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,

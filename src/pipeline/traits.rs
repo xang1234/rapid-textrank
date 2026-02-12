@@ -11,6 +11,7 @@ use crate::pipeline::artifacts::{
 };
 use crate::types::{ChunkSpan, PosTag, TextRankConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ============================================================================
 // Preprocessor — optional token normalization (stage 0)
@@ -763,6 +764,75 @@ impl TeleportBuilder for FocusTermsTeleportBuilder {
             let lemma = pool.get(w.lemma_id).unwrap_or("");
             let is_focus = self.focus_terms.iter().any(|ft| ft == lemma);
             tv.set(i, if is_focus { self.bias_weight } else { 1.0 });
+        }
+
+        tv.normalize();
+        Some(tv)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopicWeightsTeleportBuilder — per-lemma topic weights (TopicalPageRank)
+// ---------------------------------------------------------------------------
+
+/// Assigns teleport probability proportional to externally-provided topic
+/// weights. Each candidate's lemma is looked up in a `HashMap<String, f64>`;
+/// candidates not found in the map receive a floor value of `min_weight`.
+///
+/// The resulting vector is normalized so the values form a valid probability
+/// distribution.
+///
+/// Returns `None` for phrase-level candidates or empty candidate sets.
+#[derive(Debug, Clone)]
+pub struct TopicWeightsTeleportBuilder {
+    /// Per-lemma topic weights (e.g. from an LDA model or TF-IDF profile).
+    topic_weights: HashMap<String, f64>,
+    /// Floor weight for candidates not present in `topic_weights`.
+    min_weight: f64,
+}
+
+impl TopicWeightsTeleportBuilder {
+    /// Create a new builder with the given topic weights and minimum weight
+    /// floor.
+    ///
+    /// `topic_weights` maps lemmatized terms to their topic relevance scores.
+    /// `min_weight` is assigned to any candidate whose lemma is absent from
+    /// the map — use `0.0` to completely suppress out-of-vocabulary terms, or
+    /// a small positive value (e.g. `0.01`) to keep a background probability.
+    pub fn new(topic_weights: HashMap<String, f64>, min_weight: f64) -> Self {
+        Self {
+            topic_weights,
+            min_weight,
+        }
+    }
+}
+
+impl TeleportBuilder for TopicWeightsTeleportBuilder {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        _cfg: &TextRankConfig,
+    ) -> Option<TeleportVector> {
+        let words = match candidates.kind() {
+            CandidateKind::Words(w) => w,
+            CandidateKind::Phrases(_) => return None,
+        };
+        if words.is_empty() {
+            return None;
+        }
+
+        let pool = tokens.pool();
+        let mut tv = TeleportVector::zeros(words.len(), TeleportType::Topic);
+
+        for (i, w) in words.iter().enumerate() {
+            let lemma = pool.get(w.lemma_id).unwrap_or("");
+            let weight = self
+                .topic_weights
+                .get(lemma)
+                .copied()
+                .unwrap_or(self.min_weight);
+            tv.set(i, weight);
         }
 
         tv.normalize();
@@ -3290,6 +3360,196 @@ mod tests {
 
         assert!(tv.is_normalized(1e-10));
         assert_eq!(tv.len(), cs.len());
+    }
+
+    // ================================================================
+    // TeleportBuilder — TopicWeightsTeleportBuilder tests
+    // ================================================================
+
+    #[test]
+    fn test_topic_teleport_returns_normalized_vector() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 2.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.01);
+        let result = builder.build(stream.as_ref(), cs.as_ref(), &cfg);
+        assert!(result.is_some());
+
+        let tv = result.unwrap();
+        assert_eq!(tv.len(), cs.len());
+        assert!(tv.is_normalized(1e-10));
+        assert_eq!(tv.teleport_type(), TeleportType::Topic);
+    }
+
+    #[test]
+    fn test_topic_teleport_boosts_weighted_terms() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 5.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.01);
+        let tv = builder.build(stream.as_ref(), cs.as_ref(), &cfg).unwrap();
+
+        // Find the index of "machine" among candidates.
+        let machine_idx = cs.words().iter()
+            .position(|w| stream.pool().get(w.lemma_id) == Some("machine"))
+            .unwrap();
+        // Find any non-weighted candidate index.
+        let other_idx = cs.words().iter()
+            .position(|w| stream.pool().get(w.lemma_id) != Some("machine"))
+            .unwrap();
+
+        assert!(
+            tv[machine_idx] > tv[other_idx],
+            "Weighted term 'machine' should have higher teleport probability"
+        );
+    }
+
+    #[test]
+    fn test_topic_teleport_different_weights() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 10.0);
+        weights.insert("rust".to_string(), 2.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.01);
+        let tv = builder.build(stream.as_ref(), cs.as_ref(), &cfg).unwrap();
+
+        let machine_idx = cs.words().iter()
+            .position(|w| stream.pool().get(w.lemma_id) == Some("machine"))
+            .unwrap();
+        let rust_idx = cs.words().iter()
+            .position(|w| stream.pool().get(w.lemma_id) == Some("rust"))
+            .unwrap();
+
+        assert!(
+            tv[machine_idx] > tv[rust_idx],
+            "Higher-weighted term should have higher teleport probability"
+        );
+    }
+
+    #[test]
+    fn test_topic_teleport_min_weight_floor() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        // Only provide a weight for "machine"; everything else gets min_weight.
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 5.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.5);
+        let tv = builder.build(stream.as_ref(), cs.as_ref(), &cfg).unwrap();
+
+        // All non-"machine" candidates should have the same (lower) probability.
+        let non_machine: Vec<f64> = cs.words().iter().enumerate()
+            .filter(|(_, w)| stream.pool().get(w.lemma_id) != Some("machine"))
+            .map(|(i, _)| tv[i])
+            .collect();
+
+        assert!(!non_machine.is_empty());
+        let first = non_machine[0];
+        for &v in &non_machine[1..] {
+            assert!(
+                (v - first).abs() < 1e-10,
+                "All OOV candidates should have equal probability from min_weight"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_teleport_empty_candidates() {
+        let stream = TokenStream::from_tokens(&[]);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        let mut weights = HashMap::new();
+        weights.insert("machine".to_string(), 1.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.01);
+        let result = builder.build(stream.as_ref(), cs.as_ref(), &cfg);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_topic_teleport_phrase_candidates_returns_none() {
+        let tokens = vec![
+            Token::new("big", "big", PosTag::Adjective, 0, 3, 0, 0),
+            Token::new("cat", "cat", PosTag::Noun, 4, 7, 0, 1),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let chunks = vec![ChunkSpan {
+            start_token: 0, end_token: 2, start_char: 0, end_char: 7, sentence_idx: 0,
+        }];
+        let cs = PhraseCandidateSelector::new(chunks).select(stream.as_ref(), &cfg);
+
+        let mut weights = HashMap::new();
+        weights.insert("big".to_string(), 5.0);
+
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.01);
+        let result = builder.build(stream.as_ref(), cs.as_ref(), &cfg);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_topic_teleport_all_oov_with_zero_min() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        // No matching terms and min_weight = 0 → all zeros → normalize gives
+        // uniform distribution (TeleportVector::normalize falls back to uniform
+        // when the sum is zero).
+        let weights = HashMap::new();
+        let builder = TopicWeightsTeleportBuilder::new(weights, 0.0);
+        let tv = builder.build(stream.as_ref(), cs.as_ref(), &cfg).unwrap();
+
+        assert!(tv.is_normalized(1e-10));
+        let expected = 1.0 / cs.len() as f64;
+        for &v in tv.as_slice() {
+            assert!(
+                (v - expected).abs() < 1e-10,
+                "All-zero weights should normalize to uniform"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_teleport_empty_weights_map() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let cs = word_candidates(&stream, &cfg);
+
+        // Empty weights map with positive min_weight → all candidates get min_weight → uniform.
+        let builder = TopicWeightsTeleportBuilder::new(HashMap::new(), 0.5);
+        let tv = builder.build(stream.as_ref(), cs.as_ref(), &cfg).unwrap();
+
+        assert!(tv.is_normalized(1e-10));
+        let expected = 1.0 / cs.len() as f64;
+        for &v in tv.as_slice() {
+            assert!(
+                (v - expected).abs() < 1e-10,
+                "Empty weights map should produce uniform distribution"
+            );
+        }
     }
 
     // ================================================================

@@ -47,6 +47,7 @@ pub use pipeline::validation::{ValidationEngine, ValidationReport};
 pub use pipeline::{
     CandidateSelector, ChunkPhraseBuilder, CooccurrenceGraphBuilder, EdgeWeightPolicy,
     FocusTermsTeleportBuilder, NoopGraphTransform, NoopPreprocessor, PhraseBuilder,
+    TopicWeightsTeleportBuilder,
     PhraseCandidateSelector, PositionTeleportBuilder, Preprocessor, ResultFormatter,
     StandardResultFormatter, TeleportBuilder, TeleportType, TeleportVector, TokenEntry,
     TokenStream, TokenStreamRef, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
