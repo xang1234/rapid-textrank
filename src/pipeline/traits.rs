@@ -689,6 +689,167 @@ impl GraphTransform for IntraTopicEdgeRemover {
     }
 }
 
+/// Boosts edges toward the first-occurring variant in each topic cluster.
+///
+/// Implements the MultipartiteRank alpha-boost adjustment: for each topic
+/// cluster with multiple phrase variants, the earliest-occurring variant
+/// receives additional incoming edge weight.  The boost is proportional to
+/// the sum of outgoing edge weights from the other variants in the topic
+/// to each external node, scaled by:
+///
+/// ```text
+/// boost = alpha * exp(1 / (1 + p)) * booster_sum
+/// ```
+///
+/// where `p` is the token offset of the first variant and `booster_sum` is
+/// the sum of edge weights from the remaining variants to the external node.
+///
+/// # Design note — CSR limitations
+///
+/// The legacy `adjust_weights` runs on the mutable `GraphBuilder` and can
+/// create new directed edges.  In the CSR representation the edge structure
+/// is fixed; only existing edge weights may be modified.  If a cross-cluster
+/// edge `c_j → first_idx` does not exist in the CSR, the boost for that
+/// pair is skipped.  In practice this is rare because the cooccurrence
+/// graph builder creates edges symmetrically.
+///
+/// # Ordering
+///
+/// In a MultipartiteRank pipeline, apply [`IntraTopicEdgeRemover`] **before**
+/// this transform so that intra-cluster edges are zeroed and do not
+/// contribute to the boost calculation.
+///
+/// # Panics
+///
+/// Panics if `ClusterAssignments::num_candidates()` does not equal the
+/// number of graph nodes.
+#[derive(Debug, Clone)]
+pub struct AlphaBoostWeighter {
+    assignments: ClusterAssignments,
+    /// Boost scaling factor (default: 1.1, matching MultipartiteRank).
+    pub alpha: f64,
+}
+
+impl AlphaBoostWeighter {
+    /// Create with pre-computed cluster assignments and the default alpha (1.1).
+    pub fn new(assignments: ClusterAssignments) -> Self {
+        Self {
+            assignments,
+            alpha: 1.1,
+        }
+    }
+
+    /// Create with custom alpha.
+    pub fn with_alpha(assignments: ClusterAssignments, alpha: f64) -> Self {
+        Self { assignments, alpha }
+    }
+
+    /// Borrow the inner cluster assignments.
+    pub fn assignments(&self) -> &ClusterAssignments {
+        &self.assignments
+    }
+}
+
+impl GraphTransform for AlphaBoostWeighter {
+    fn transform(
+        &self,
+        graph: &mut Graph,
+        _tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        _cfg: &TextRankConfig,
+    ) {
+        let n = graph.num_nodes();
+        if n == 0 || self.assignments.is_empty() {
+            return;
+        }
+
+        assert_eq!(
+            self.assignments.num_candidates(),
+            n,
+            "AlphaBoostWeighter: cluster assignments length ({}) != graph node count ({})",
+            self.assignments.num_candidates(),
+            n,
+        );
+
+        let phrases = candidates.phrases();
+
+        // For each cluster, find members and the first-occurring variant.
+        let num_clusters = self.assignments.num_clusters();
+        let csr = graph.csr_mut();
+
+        for cluster_id in 0..num_clusters {
+            let members = self.assignments.members_of(cluster_id);
+            if members.len() <= 1 {
+                continue;
+            }
+
+            // Find the first-occurring variant (lowest start_token).
+            let first_idx = *members
+                .iter()
+                .min_by_key(|&&idx| phrases[idx].start_token)
+                .unwrap();
+
+            let p_first = phrases[first_idx].start_token;
+            let position_factor = (1.0 / (1.0 + p_first as f64)).exp();
+
+            // For each external node c_j (different cluster), accumulate
+            // booster weights from non-first variants.
+            for c_j in 0..n {
+                if self.assignments.cluster_of(c_j) == cluster_id {
+                    continue; // skip same-cluster nodes
+                }
+
+                let mut booster_sum = 0.0;
+                for &v in &members {
+                    if v == first_idx {
+                        continue;
+                    }
+                    // Find edge weight v → c_j in CSR.
+                    let start = csr.row_ptr[v];
+                    let end = csr.row_ptr[v + 1];
+                    for idx in start..end {
+                        if csr.col_idx[idx] == c_j as u32 {
+                            booster_sum += csr.weights[idx];
+                            break;
+                        }
+                    }
+                }
+
+                if booster_sum > 0.0 {
+                    let boost = self.alpha * position_factor * booster_sum;
+                    // Add boost to edge c_j → first_idx.
+                    let start = csr.row_ptr[c_j];
+                    let end = csr.row_ptr[c_j + 1];
+                    for idx in start..end {
+                        if csr.col_idx[idx] == first_idx as u32 {
+                            csr.weights[idx] += boost;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recompute out_degree and total_weight after boosting.
+        for node in 0..n {
+            let start = csr.row_ptr[node];
+            let end = csr.row_ptr[node + 1];
+
+            let mut degree = 0u32;
+            let mut total = 0.0f64;
+            for idx in start..end {
+                let w = csr.weights[idx];
+                if w > 0.0 {
+                    degree += 1;
+                    total += w;
+                }
+            }
+            csr.out_degree[node] = degree;
+            csr.total_weight[node] = total;
+        }
+    }
+}
+
 // ============================================================================
 // Clusterer — topic clustering of phrase candidates (stage 1a)
 // ============================================================================
@@ -3395,6 +3556,226 @@ mod tests {
         let remover = IntraTopicEdgeRemover::new(assignments);
         assert_eq!(remover.assignments().num_clusters(), 2);
         assert_eq!(remover.assignments().num_candidates(), 2);
+    }
+
+    // ================================================================
+    // AlphaBoostWeighter tests
+    // ================================================================
+
+    /// Helper: build a 4-node graph with phrase-level candidates for alpha-boost tests.
+    ///
+    /// Graph (bidirectional, all weight 1.0):
+    ///   0 -- 1,  0 -- 2,  1 -- 2,  2 -- 3
+    ///
+    /// Phrase candidates (positions for alpha-boost):
+    ///   0: start_token=0  (earliest)
+    ///   1: start_token=3
+    ///   2: start_token=6
+    ///   3: start_token=9
+    fn phrase_candidates_4() -> CandidateSet {
+        let phrases = vec![
+            PhraseCandidate {
+                start_token: 0, end_token: 2, start_char: 0, end_char: 10,
+                sentence_idx: 0, lemma_ids: vec![0], term_ids: vec![10],
+            },
+            PhraseCandidate {
+                start_token: 3, end_token: 5, start_char: 11, end_char: 20,
+                sentence_idx: 0, lemma_ids: vec![1], term_ids: vec![20],
+            },
+            PhraseCandidate {
+                start_token: 6, end_token: 8, start_char: 21, end_char: 30,
+                sentence_idx: 1, lemma_ids: vec![2], term_ids: vec![30],
+            },
+            PhraseCandidate {
+                start_token: 9, end_token: 11, start_char: 31, end_char: 40,
+                sentence_idx: 1, lemma_ids: vec![3], term_ids: vec![40],
+            },
+        ];
+        CandidateSet::from_kind(CandidateKind::Phrases(phrases))
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_increases_first_variant_weight() {
+        // Cluster {0, 1} in topic 0, {2} in topic 1, {3} in topic 2.
+        // Node 0 is the first variant (start_token=0).
+        // Node 1 has edge to 2 (weight 1.0) → boost redirected to 0.
+        let mut graph = build_test_graph_4nodes();
+        let cfg = TextRankConfig::default();
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = phrase_candidates_4();
+
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0, 1], vec![2], vec![3]], 4);
+        let booster = AlphaBoostWeighter::new(assignments);
+
+        // Before: edge 2→0 has weight 1.0
+        let w_before: f64 = graph.neighbors(2).find(|&(n, _)| n == 0).unwrap().1;
+        assert!((w_before - 1.0).abs() < 1e-10);
+
+        booster.transform(&mut graph, stream.as_ref(), cs.as_ref(), &cfg);
+
+        // After: edge 2→0 should be boosted (> 1.0) because node 1 (same
+        // cluster) has edge 1→2 with weight 1.0, which becomes a boost for 0.
+        let w_after: f64 = graph.neighbors(2).find(|&(n, _)| n == 0).unwrap().1;
+        assert!(
+            w_after > w_before,
+            "Edge 2→0 should be boosted: before={}, after={}",
+            w_before, w_after,
+        );
+        assert!(graph.is_transformed());
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_default_alpha() {
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0], vec![1]], 2);
+        let booster = AlphaBoostWeighter::new(assignments);
+        assert!((booster.alpha - 1.1).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_custom_alpha() {
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0], vec![1]], 2);
+        let booster = AlphaBoostWeighter::with_alpha(assignments, 2.5);
+        assert!((booster.alpha - 2.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_accessor() {
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0], vec![1, 2]], 3);
+        let booster = AlphaBoostWeighter::new(assignments);
+        assert_eq!(booster.assignments().num_clusters(), 2);
+        assert_eq!(booster.assignments().num_candidates(), 3);
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_single_member_clusters_noop() {
+        // When every cluster has exactly one member, no boost is applied.
+        let mut graph = build_test_graph_4nodes();
+        let cfg = TextRankConfig::default();
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = phrase_candidates_4();
+
+        // Snapshot weights before.
+        let weights_before: Vec<Vec<(u32, f64)>> = (0..4)
+            .map(|n| graph.neighbors(n).collect())
+            .collect();
+
+        let assignments = ClusterAssignments::from_cluster_vecs(
+            &[vec![0], vec![1], vec![2], vec![3]], 4,
+        );
+        let booster = AlphaBoostWeighter::new(assignments);
+        booster.transform(&mut graph, stream.as_ref(), cs.as_ref(), &cfg);
+
+        // All weights should be unchanged.
+        for node in 0..4u32 {
+            let weights_after: Vec<(u32, f64)> = graph.neighbors(node).collect();
+            assert_eq!(
+                weights_before[node as usize], weights_after,
+                "Node {} weights should be unchanged with single-member clusters", node,
+            );
+        }
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_empty_graph() {
+        let stream = TokenStream::from_tokens(&[]);
+        let cfg = TextRankConfig::default();
+        let cs = CandidateSet::from_kind(CandidateKind::Phrases(Vec::new()));
+
+        let mut graph = Graph::empty();
+        let assignments = ClusterAssignments::empty();
+        let booster = AlphaBoostWeighter::new(assignments);
+
+        // Should not panic on empty graph.
+        booster.transform(&mut graph, stream.as_ref(), cs.as_ref(), &cfg);
+        assert!(graph.is_empty());
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_trait_object() {
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0, 1], vec![2, 3]], 4);
+        let transform: Box<dyn GraphTransform> =
+            Box::new(AlphaBoostWeighter::new(assignments));
+
+        let mut graph = build_test_graph_4nodes();
+        let cfg = TextRankConfig::default();
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = phrase_candidates_4();
+
+        // Should compile and run through trait object.
+        transform.transform(&mut graph, stream.as_ref(), cs.as_ref(), &cfg);
+        assert!(graph.is_transformed());
+    }
+
+    #[test]
+    fn test_alpha_boost_weighter_updates_degree_and_total_weight() {
+        let mut graph = build_test_graph_4nodes();
+        let cfg = TextRankConfig::default();
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = phrase_candidates_4();
+
+        let assignments =
+            ClusterAssignments::from_cluster_vecs(&[vec![0, 1], vec![2], vec![3]], 4);
+        let booster = AlphaBoostWeighter::new(assignments);
+        booster.transform(&mut graph, stream.as_ref(), cs.as_ref(), &cfg);
+
+        // Verify total_weight is consistent with actual edge weights for every node.
+        for node in 0..4 {
+            let actual_total: f64 = graph.neighbors(node as u32)
+                .filter(|&(_, w)| w > 0.0)
+                .map(|(_, w)| w)
+                .sum();
+            let actual_degree: u32 = graph.neighbors(node as u32)
+                .filter(|&(_, w)| w > 0.0)
+                .count() as u32;
+            assert!(
+                (graph.csr().total_weight[node] - actual_total).abs() < 1e-10,
+                "Node {} total_weight mismatch: stored={}, actual={}",
+                node, graph.csr().total_weight[node], actual_total,
+            );
+            assert_eq!(
+                graph.csr().out_degree[node], actual_degree,
+                "Node {} out_degree mismatch", node,
+            );
+        }
+    }
+
+    #[test]
+    fn test_alpha_boost_higher_alpha_gives_larger_boost() {
+        let cfg = TextRankConfig::default();
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = phrase_candidates_4();
+
+        let assignments1 =
+            ClusterAssignments::from_cluster_vecs(&[vec![0, 1], vec![2], vec![3]], 4);
+        let assignments2 =
+            ClusterAssignments::from_cluster_vecs(&[vec![0, 1], vec![2], vec![3]], 4);
+
+        let mut graph1 = build_test_graph_4nodes();
+        AlphaBoostWeighter::with_alpha(assignments1, 1.0)
+            .transform(&mut graph1, stream.as_ref(), cs.as_ref(), &cfg);
+
+        let mut graph2 = build_test_graph_4nodes();
+        AlphaBoostWeighter::with_alpha(assignments2, 3.0)
+            .transform(&mut graph2, stream.as_ref(), cs.as_ref(), &cfg);
+
+        // Edge 2→0 should be more boosted with alpha=3.0 than alpha=1.0.
+        let w1: f64 = graph1.neighbors(2).find(|&(n, _)| n == 0).unwrap().1;
+        let w2: f64 = graph2.neighbors(2).find(|&(n, _)| n == 0).unwrap().1;
+        assert!(
+            w2 > w1,
+            "Higher alpha should produce larger boost: alpha=1.0 → {}, alpha=3.0 → {}",
+            w1, w2,
+        );
     }
 
     // ================================================================
