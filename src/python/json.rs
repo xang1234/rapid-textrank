@@ -813,6 +813,135 @@ mod tests {
         assert!(config.include_pos.contains(&crate::types::PosTag::Verb));
     }
 
+    // ─── Topic family JSON integration tests ───────────────────────
+
+    #[test]
+    fn test_json_topic_rank_extraction() {
+        let json_input = r#"{
+            "tokens": [
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN", "start": 0, "end": 7, "sentence_idx": 0, "token_idx": 0},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN", "start": 8, "end": 16, "sentence_idx": 0, "token_idx": 1},
+                {"text": "algorithms", "lemma": "algorithm", "pos": "NOUN", "start": 17, "end": 27, "sentence_idx": 0, "token_idx": 2},
+                {"text": "Deep", "lemma": "deep", "pos": "ADJ", "start": 52, "end": 56, "sentence_idx": 1, "token_idx": 3},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN", "start": 57, "end": 65, "sentence_idx": 1, "token_idx": 4},
+                {"text": "models", "lemma": "model", "pos": "NOUN", "start": 66, "end": 72, "sentence_idx": 1, "token_idx": 5},
+                {"text": "neural", "lemma": "neural", "pos": "ADJ", "start": 77, "end": 83, "sentence_idx": 1, "token_idx": 6},
+                {"text": "networks", "lemma": "network", "pos": "NOUN", "start": 84, "end": 92, "sentence_idx": 1, "token_idx": 7}
+            ],
+            "variant": "topic_rank",
+            "config": {
+                "top_n": 5,
+                "determinism": "deterministic"
+            }
+        }"#;
+
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let json_config = doc.config.clone().unwrap_or_default();
+        let config: TextRankConfig = json_config.clone().into();
+        let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+
+        let result = extract_with_variant(
+            &tokens,
+            &config,
+            &json_config,
+            crate::variants::Variant::TopicRank,
+        );
+
+        assert!(result.converged);
+        assert!(!result.phrases.is_empty());
+        // Scores should be in descending order
+        for w in result.phrases.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+        // Ranks should be 1-indexed and contiguous
+        for (i, p) in result.phrases.iter().enumerate() {
+            assert_eq!(p.rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_json_multipartite_rank_extraction() {
+        let json_input = r#"{
+            "tokens": [
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN", "start": 0, "end": 7, "sentence_idx": 0, "token_idx": 0},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN", "start": 8, "end": 16, "sentence_idx": 0, "token_idx": 1},
+                {"text": "algorithms", "lemma": "algorithm", "pos": "NOUN", "start": 17, "end": 27, "sentence_idx": 0, "token_idx": 2},
+                {"text": "neural", "lemma": "neural", "pos": "ADJ", "start": 77, "end": 83, "sentence_idx": 1, "token_idx": 3},
+                {"text": "networks", "lemma": "network", "pos": "NOUN", "start": 84, "end": 92, "sentence_idx": 1, "token_idx": 4},
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN", "start": 94, "end": 101, "sentence_idx": 2, "token_idx": 5},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN", "start": 102, "end": 110, "sentence_idx": 2, "token_idx": 6},
+                {"text": "techniques", "lemma": "technique", "pos": "NOUN", "start": 111, "end": 121, "sentence_idx": 2, "token_idx": 7}
+            ],
+            "variant": "multipartite_rank",
+            "config": {
+                "top_n": 5,
+                "multipartite_alpha": 1.1,
+                "multipartite_similarity_threshold": 0.26,
+                "determinism": "deterministic"
+            }
+        }"#;
+
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let json_config = doc.config.clone().unwrap_or_default();
+        let config: TextRankConfig = json_config.clone().into();
+        let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+
+        let result = extract_with_variant(
+            &tokens,
+            &config,
+            &json_config,
+            crate::variants::Variant::MultipartiteRank,
+        );
+
+        assert!(result.converged);
+        assert!(!result.phrases.is_empty());
+        for w in result.phrases.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+        for (i, p) in result.phrases.iter().enumerate() {
+            assert_eq!(p.rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_json_topic_rank_config_parameters() {
+        // Verify that topic_similarity_threshold and topic_edge_weight
+        // are correctly deserialized and affect the variant dispatch.
+        let json_input = r#"{
+            "tokens": [
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN", "start": 0, "end": 7, "sentence_idx": 0, "token_idx": 0},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN", "start": 8, "end": 16, "sentence_idx": 0, "token_idx": 1}
+            ],
+            "variant": "topic_rank",
+            "config": {
+                "topic_similarity_threshold": 0.5,
+                "topic_edge_weight": 2.0
+            }
+        }"#;
+
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let json_config = doc.config.unwrap();
+        assert!((json_config.topic_similarity_threshold - 0.5).abs() < 1e-10);
+        assert!((json_config.topic_edge_weight - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_json_multipartite_rank_config_parameters() {
+        let json_input = r#"{
+            "tokens": [],
+            "variant": "multipartite_rank",
+            "config": {
+                "multipartite_alpha": 2.5,
+                "multipartite_similarity_threshold": 0.3
+            }
+        }"#;
+
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let json_config = doc.config.unwrap();
+        assert!((json_config.multipartite_alpha - 2.5).abs() < 1e-10);
+        assert!((json_config.multipartite_similarity_threshold - 0.3).abs() < 1e-10);
+    }
+
     #[test]
     fn test_json_include_pos_multiple_tags() {
         // Test with multiple POS tags in include_pos

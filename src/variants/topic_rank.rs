@@ -402,6 +402,121 @@ mod tests {
         }
     }
 
+    // ─── Integration test helpers ─────────────────────────────────
+
+    /// Richer 4-sentence corpus with repeated phrases across topics.
+    /// Used by golden tests, determinism tests, and structural checks.
+    fn make_rich_tokens() -> Vec<Token> {
+        vec![
+            // Sentence 0: "Machine learning algorithms process large datasets"
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("algorithms", "algorithm", PosTag::Noun, 17, 27, 0, 2),
+            Token::new("process", "process", PosTag::Verb, 28, 35, 0, 3),
+            Token::new("large", "large", PosTag::Adjective, 36, 41, 0, 4),
+            Token::new("datasets", "dataset", PosTag::Noun, 42, 50, 0, 5),
+            // Sentence 1: "Deep learning models use neural networks"
+            Token::new("Deep", "deep", PosTag::Adjective, 52, 56, 1, 6),
+            Token::new("learning", "learning", PosTag::Noun, 57, 65, 1, 7),
+            Token::new("models", "model", PosTag::Noun, 66, 72, 1, 8),
+            Token::new("use", "use", PosTag::Verb, 73, 76, 1, 9),
+            Token::new("neural", "neural", PosTag::Adjective, 77, 83, 1, 10),
+            Token::new("networks", "network", PosTag::Noun, 84, 92, 1, 11),
+            // Sentence 2: "Machine learning techniques improve data analysis"
+            Token::new("Machine", "machine", PosTag::Noun, 94, 101, 2, 12),
+            Token::new("learning", "learning", PosTag::Noun, 102, 110, 2, 13),
+            Token::new("techniques", "technique", PosTag::Noun, 111, 121, 2, 14),
+            Token::new("improve", "improve", PosTag::Verb, 122, 129, 2, 15),
+            Token::new("data", "data", PosTag::Noun, 130, 134, 2, 16),
+            Token::new("analysis", "analysis", PosTag::Noun, 135, 143, 2, 17),
+            // Sentence 3: "Neural networks enable deep learning applications"
+            Token::new("Neural", "neural", PosTag::Adjective, 145, 151, 3, 18),
+            Token::new("networks", "network", PosTag::Noun, 152, 160, 3, 19),
+            Token::new("enable", "enable", PosTag::Verb, 161, 167, 3, 20),
+            Token::new("deep", "deep", PosTag::Adjective, 168, 172, 3, 21),
+            Token::new("learning", "learning", PosTag::Noun, 173, 181, 3, 22),
+            Token::new("applications", "application", PosTag::Noun, 182, 194, 3, 23),
+        ]
+    }
+
+    // ─── Clustering determinism ──────────────────────────────────
+
+    #[test]
+    fn test_clustering_determinism() {
+        let tokens = make_rich_tokens();
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..Default::default()
+        };
+        let baseline = TopicRank::with_config(config.clone()).extract_with_info(&tokens);
+
+        for _ in 0..10 {
+            let result = TopicRank::with_config(config.clone()).extract_with_info(&tokens);
+            assert_eq!(
+                result.phrases.len(),
+                baseline.phrases.len(),
+                "Number of phrases should be stable across runs"
+            );
+            for (b, r) in baseline.phrases.iter().zip(result.phrases.iter()) {
+                assert_eq!(b.text, r.text, "Phrase text order should be deterministic");
+                assert_eq!(b.lemma, r.lemma);
+                assert!(
+                    (b.score - r.score).abs() < 1e-12,
+                    "Scores should be bitwise-identical: {} vs {}",
+                    b.score,
+                    r.score,
+                );
+                assert_eq!(b.rank, r.rank);
+                assert_eq!(b.offsets, r.offsets);
+            }
+        }
+    }
+
+    // ─── TopicRank golden test ───────────────────────────────────
+
+    #[test]
+    fn test_topic_rank_golden() {
+        let tokens = make_rich_tokens();
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..Default::default()
+        };
+        let result = TopicRank::with_config(config).extract_with_info(&tokens);
+
+        assert!(result.converged, "PageRank should converge");
+        assert_eq!(result.iterations, 17);
+        assert_eq!(result.phrases.len(), 6);
+
+        // Pin exact phrase order, lemmas, and approximate scores.
+        let expected = [
+            (1, "neural network", 0.2579807),
+            (2, "machine learning algorithm", 0.2114519),
+            (3, "deep learning model", 0.1531721),
+            (4, "data analysis", 0.1479700),
+            (5, "large dataset", 0.1399592),
+            (6, "deep learning application", 0.0894658),
+        ];
+        for (phrase, &(rank, lemma, approx_score)) in result.phrases.iter().zip(expected.iter()) {
+            assert_eq!(phrase.rank, rank, "rank mismatch for {:?}", phrase.lemma);
+            assert_eq!(phrase.lemma, lemma, "lemma mismatch at rank {}", rank);
+            assert!(
+                (phrase.score - approx_score).abs() < 1e-5,
+                "score mismatch for {}: expected ~{}, got {}",
+                lemma,
+                approx_score,
+                phrase.score,
+            );
+        }
+
+        // Verify multi-occurrence phrases have correct offset counts.
+        let neural = &result.phrases[0];
+        assert_eq!(neural.count, 2, "neural network appears 2x");
+        assert_eq!(neural.offsets.len(), 2);
+
+        let ml = &result.phrases[1];
+        assert_eq!(ml.count, 2, "machine learning algorithm cluster has 2 members");
+    }
+
     #[test]
     fn test_compute_gap() {
         fn span(start: usize, end: usize) -> ChunkSpan {

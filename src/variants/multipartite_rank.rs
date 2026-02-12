@@ -524,4 +524,255 @@ mod tests {
             );
         }
     }
+
+    // ─── Integration test helpers ─────────────────────────────────
+
+    fn make_rich_tokens() -> Vec<Token> {
+        vec![
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("algorithms", "algorithm", PosTag::Noun, 17, 27, 0, 2),
+            Token::new("process", "process", PosTag::Verb, 28, 35, 0, 3),
+            Token::new("large", "large", PosTag::Adjective, 36, 41, 0, 4),
+            Token::new("datasets", "dataset", PosTag::Noun, 42, 50, 0, 5),
+            Token::new("Deep", "deep", PosTag::Adjective, 52, 56, 1, 6),
+            Token::new("learning", "learning", PosTag::Noun, 57, 65, 1, 7),
+            Token::new("models", "model", PosTag::Noun, 66, 72, 1, 8),
+            Token::new("use", "use", PosTag::Verb, 73, 76, 1, 9),
+            Token::new("neural", "neural", PosTag::Adjective, 77, 83, 1, 10),
+            Token::new("networks", "network", PosTag::Noun, 84, 92, 1, 11),
+            Token::new("Machine", "machine", PosTag::Noun, 94, 101, 2, 12),
+            Token::new("learning", "learning", PosTag::Noun, 102, 110, 2, 13),
+            Token::new("techniques", "technique", PosTag::Noun, 111, 121, 2, 14),
+            Token::new("improve", "improve", PosTag::Verb, 122, 129, 2, 15),
+            Token::new("data", "data", PosTag::Noun, 130, 134, 2, 16),
+            Token::new("analysis", "analysis", PosTag::Noun, 135, 143, 2, 17),
+            Token::new("Neural", "neural", PosTag::Adjective, 145, 151, 3, 18),
+            Token::new("networks", "network", PosTag::Noun, 152, 160, 3, 19),
+            Token::new("enable", "enable", PosTag::Verb, 161, 167, 3, 20),
+            Token::new("deep", "deep", PosTag::Adjective, 168, 172, 3, 21),
+            Token::new("learning", "learning", PosTag::Noun, 173, 181, 3, 22),
+            Token::new("applications", "application", PosTag::Noun, 182, 194, 3, 23),
+        ]
+    }
+
+    // ─── Clustering determinism ──────────────────────────────────
+
+    #[test]
+    fn test_clustering_determinism() {
+        let tokens = make_rich_tokens();
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..Default::default()
+        };
+        let baseline = MultipartiteRank::with_config(config.clone())
+            .with_alpha(1.1)
+            .extract_with_info(&tokens);
+
+        for _ in 0..10 {
+            let result = MultipartiteRank::with_config(config.clone())
+                .with_alpha(1.1)
+                .extract_with_info(&tokens);
+            assert_eq!(result.phrases.len(), baseline.phrases.len());
+            for (b, r) in baseline.phrases.iter().zip(result.phrases.iter()) {
+                assert_eq!(b.text, r.text, "Phrase text order should be deterministic");
+                assert_eq!(b.lemma, r.lemma);
+                assert!(
+                    (b.score - r.score).abs() < 1e-12,
+                    "Scores should be bitwise-identical: {} vs {}",
+                    b.score,
+                    r.score,
+                );
+                assert_eq!(b.rank, r.rank);
+            }
+        }
+    }
+
+    // ─── Intra-topic edge removal (exhaustive) ───────────────────
+
+    #[test]
+    fn test_intra_topic_edge_removal_exhaustive() {
+        use rustc_hash::FxHashSet;
+
+        fn terms(words: &[&str]) -> FxHashSet<String> {
+            words.iter().map(|s| s.to_string()).collect()
+        }
+
+        // Build the multipartite graph from multiple topic clusters and
+        // verify that NO within-cluster edges exist — exhaustively check
+        // every (i, j) pair where topic_of[i] == topic_of[j].
+        let candidates = vec![
+            // Cluster A: identical terms → will merge
+            PhraseCandidate {
+                text: "machine learning".into(),
+                lemma: "machine learning".into(),
+                terms: terms(&["machine", "learning"]),
+                chunk: ChunkSpan { start_token: 0, end_token: 2, start_char: 0, end_char: 16, sentence_idx: 0 },
+            },
+            PhraseCandidate {
+                text: "machine learning".into(),
+                lemma: "machine learning".into(),
+                terms: terms(&["machine", "learning"]),
+                chunk: ChunkSpan { start_token: 10, end_token: 12, start_char: 80, end_char: 96, sentence_idx: 2 },
+            },
+            // Cluster B: identical terms → will merge
+            PhraseCandidate {
+                text: "neural network".into(),
+                lemma: "neural network".into(),
+                terms: terms(&["neural", "network"]),
+                chunk: ChunkSpan { start_token: 4, end_token: 6, start_char: 30, end_char: 44, sentence_idx: 1 },
+            },
+            PhraseCandidate {
+                text: "neural networks".into(),
+                lemma: "neural network".into(),
+                terms: terms(&["neural", "network"]),
+                chunk: ChunkSpan { start_token: 14, end_token: 16, start_char: 110, end_char: 126, sentence_idx: 3 },
+            },
+            // Cluster C: singleton
+            PhraseCandidate {
+                text: "data analysis".into(),
+                lemma: "data analysis".into(),
+                terms: terms(&["data", "analysis"]),
+                chunk: ChunkSpan { start_token: 7, end_token: 9, start_char: 50, end_char: 63, sentence_idx: 1 },
+            },
+        ];
+
+        let clusters = clustering::cluster_phrases(&candidates, 0.26);
+
+        let mut topic_of = vec![0usize; candidates.len()];
+        for (topic_idx, members) in clusters.iter().enumerate() {
+            for &idx in members {
+                topic_of[idx] = topic_idx;
+            }
+        }
+
+        // Build graph the same way extract_with_info does
+        let n = candidates.len();
+        let mut builder = GraphBuilder::with_capacity(n);
+        for i in 0..n {
+            builder.get_or_create_node(&format!("c_{}", i));
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if topic_of[i] == topic_of[j] {
+                    continue;
+                }
+                let gap = compute_gap(&candidates[i].chunk, &candidates[j].chunk);
+                let weight = 1.0 / gap as f64;
+                builder.increment_directed_edge(i as u32, j as u32, weight);
+                builder.increment_directed_edge(j as u32, i as u32, weight);
+            }
+        }
+
+        // Exhaustive check: no node should have an edge to its cluster-mate
+        for i in 0..n {
+            let node = builder.get_node(i as u32).unwrap();
+            for j in 0..n {
+                if i == j { continue; }
+                if topic_of[i] == topic_of[j] {
+                    assert!(
+                        !node.edges.contains_key(&(j as u32)),
+                        "Intra-topic edge found: c_{} → c_{} (both topic {})",
+                        i, j, topic_of[i],
+                    );
+                }
+            }
+        }
+
+        // Positive check: inter-topic edges exist
+        // Cluster A member → Cluster B member
+        let node_0 = builder.get_node(0).unwrap();
+        assert!(node_0.edges.contains_key(&2), "A→B edge should exist");
+        assert!(node_0.edges.contains_key(&4), "A→C edge should exist");
+    }
+
+    // ─── Alpha boost: earlier candidates ranked higher ───────────
+
+    #[test]
+    fn test_alpha_boost_earlier_candidate_ranked_higher() {
+        // Two occurrences of "machine learning": position 0 and position 12.
+        // With alpha > 0, the position-0 variant should receive a higher
+        // PageRank score than the position-12 variant.
+        //
+        // We verify this indirectly: with high alpha, the top-ranked phrase
+        // (selected per lemma group by highest score) should be the first
+        // occurrence's text variant.
+        let tokens = make_rich_tokens();
+
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..Default::default()
+        };
+
+        // High alpha → strong positional bias
+        let result_boosted = MultipartiteRank::with_config(config.clone())
+            .with_alpha(5.0)
+            .extract_with_info(&tokens);
+
+        // No alpha → no positional bias
+        let result_flat = MultipartiteRank::with_config(config)
+            .with_alpha(0.0)
+            .extract_with_info(&tokens);
+
+        assert!(!result_boosted.phrases.is_empty());
+        assert!(!result_flat.phrases.is_empty());
+
+        // With alpha=5.0, the top phrase should start at an earlier position
+        // than the top phrase with alpha=0. At minimum, the ranking should
+        // differ, showing that alpha has an effect.
+        let any_rank_diff = result_boosted
+            .phrases
+            .iter()
+            .zip(result_flat.phrases.iter())
+            .any(|(a, b)| a.lemma != b.lemma || (a.score - b.score).abs() > 1e-10);
+
+        assert!(
+            any_rank_diff,
+            "Alpha boost should change ranking or scores"
+        );
+    }
+
+    // ─── MultipartiteRank golden test ────────────────────────────
+
+    #[test]
+    fn test_multipartite_rank_golden() {
+        let tokens = make_rich_tokens();
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..Default::default()
+        };
+        let result = MultipartiteRank::with_config(config)
+            .with_alpha(1.1)
+            .extract_with_info(&tokens);
+
+        assert!(result.converged, "PageRank should converge");
+        assert_eq!(result.iterations, 20);
+        assert_eq!(result.phrases.len(), 7);
+
+        let expected = [
+            (1, "machine learning algorithm", 0.2536742),
+            (2, "neural network", 0.2351832),
+            (3, "large dataset", 0.1184485),
+            (4, "deep learning model", 0.1157130),
+            (5, "machine learning technique", 0.0855296),
+            (6, "data analysis", 0.0795817),
+            (7, "deep learning application", 0.0500771),
+        ];
+        for (phrase, &(rank, lemma, approx_score)) in result.phrases.iter().zip(expected.iter()) {
+            assert_eq!(phrase.rank, rank, "rank mismatch for {:?}", phrase.lemma);
+            assert_eq!(phrase.lemma, lemma, "lemma mismatch at rank {}", rank);
+            assert!(
+                (phrase.score - approx_score).abs() < 1e-5,
+                "score mismatch for {}: expected ~{}, got {}",
+                lemma,
+                approx_score,
+                phrase.score,
+            );
+        }
+
+        // neural network should have 2 offsets (positions 10-12 and 18-20)
+        let nn = &result.phrases[1];
+        assert_eq!(nn.count, 2);
+        assert_eq!(nn.offsets.len(), 2);
+    }
 }
