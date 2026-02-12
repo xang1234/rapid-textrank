@@ -44,9 +44,9 @@ pub use runner::{
 pub use traits::{
     CandidateSelector, ChunkPhraseBuilder, Clusterer, CooccurrenceGraphBuilder, EdgeWeightPolicy,
     FocusTermsTeleportBuilder, GraphBuilder, GraphTransform, IntraTopicEdgeRemover,
-    JaccardHacClusterer, NoopClusterer, NoopGraphTransform, NoopPreprocessor, PageRankRanker,
-    PhraseBuilder, PhraseCandidateSelector, PositionTeleportBuilder, Preprocessor, Ranker,
-    ResultFormatter, StandardResultFormatter, TeleportBuilder, TopicWeightsTeleportBuilder,
-    UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy, WordNodeSelector,
-    DEFAULT_WINDOW_SIZE,
+    JaccardHacClusterer, Linkage, NoopClusterer, NoopGraphTransform, NoopPreprocessor,
+    PageRankRanker, PhraseBuilder, PhraseCandidateSelector, PositionTeleportBuilder, Preprocessor,
+    Ranker, ResultFormatter, StandardResultFormatter, TeleportBuilder,
+    TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
+    WordNodeSelector, DEFAULT_WINDOW_SIZE,
 };

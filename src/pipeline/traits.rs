@@ -747,19 +747,21 @@ impl Clusterer for NoopClusterer {
     }
 }
 
+/// Re-export [`Linkage`] for convenient access by pipeline users.
+pub use crate::clustering::Linkage;
+
 /// Jaccard-distance HAC clusterer for the TopicRank / MultipartiteRank family.
 ///
 /// Uses hierarchical agglomerative clustering with Jaccard distance between
-/// candidate term sets and average linkage.  The `similarity_threshold`
+/// candidate term sets and configurable linkage.  The `similarity_threshold`
 /// controls the distance cutoff:
 ///
 /// - **TopicRank** default: `0.25`
 /// - **MultipartiteRank** default: `0.26`
 ///
-/// Internally delegates to [`clustering::cluster_phrases`] on legacy
-/// `PhraseCandidate` structs reconstructed from the pipeline's interned
-/// [`PhraseCandidate`](crate::pipeline::artifacts::PhraseCandidate)
-/// representation.
+/// Internally delegates to [`clustering::cluster_u32_term_sets`], operating
+/// directly on `u32` term IDs from the pipeline's interned
+/// [`PhraseCandidate`](crate::pipeline::artifacts::PhraseCandidate).
 ///
 /// # Panics
 ///
@@ -769,22 +771,34 @@ impl Clusterer for NoopClusterer {
 pub struct JaccardHacClusterer {
     /// Jaccard similarity threshold for cluster merging.
     pub similarity_threshold: f64,
+    /// Linkage strategy (default: Average).
+    pub linkage: Linkage,
 }
 
 impl JaccardHacClusterer {
-    /// Create a new clusterer with the given similarity threshold.
+    /// Create a new clusterer with the given similarity threshold and
+    /// [`Linkage::Average`] (the default).
     pub fn new(similarity_threshold: f64) -> Self {
         Self {
             similarity_threshold,
+            linkage: Linkage::Average,
         }
     }
 
-    /// TopicRank default (similarity threshold = 0.25).
+    /// Create a new clusterer with the given similarity threshold and linkage.
+    pub fn with_linkage(similarity_threshold: f64, linkage: Linkage) -> Self {
+        Self {
+            similarity_threshold,
+            linkage,
+        }
+    }
+
+    /// TopicRank default (similarity threshold = 0.25, average linkage).
     pub fn topic_rank() -> Self {
         Self::new(0.25)
     }
 
-    /// MultipartiteRank default (similarity threshold = 0.26).
+    /// MultipartiteRank default (similarity threshold = 0.26, average linkage).
     pub fn multipartite_rank() -> Self {
         Self::new(0.26)
     }
@@ -804,35 +818,14 @@ impl Clusterer for JaccardHacClusterer {
             return ClusterAssignments::empty();
         }
 
-        // Bridge: convert pipeline PhraseCandidate (interned IDs) to
-        // legacy clustering::PhraseCandidate (String term sets).
-        // The legacy HAC only needs the term sets for Jaccard distance,
-        // plus chunk spans for positional info.
-        let legacy_candidates: Vec<clustering::PhraseCandidate> = phrases
+        // Collect term_ids directly as FxHashSet<u32> — no string bridge.
+        let term_sets: Vec<FxHashSet<u32>> = phrases
             .iter()
-            .map(|pc| {
-                let terms: FxHashSet<String> = pc
-                    .term_ids
-                    .iter()
-                    .map(|&id| id.to_string())
-                    .collect();
-                clustering::PhraseCandidate {
-                    text: String::new(),
-                    lemma: String::new(),
-                    terms,
-                    chunk: crate::types::ChunkSpan {
-                        start_token: pc.start_token as usize,
-                        end_token: pc.end_token as usize,
-                        start_char: pc.start_char as usize,
-                        end_char: pc.end_char as usize,
-                        sentence_idx: pc.sentence_idx as usize,
-                    },
-                }
-            })
+            .map(|pc| pc.term_ids.iter().copied().collect())
             .collect();
 
         let cluster_vecs =
-            clustering::cluster_phrases(&legacy_candidates, self.similarity_threshold);
+            clustering::cluster_u32_term_sets(&term_sets, self.similarity_threshold, self.linkage);
         ClusterAssignments::from_cluster_vecs(&cluster_vecs, phrases.len())
     }
 }
@@ -2780,9 +2773,55 @@ mod tests {
     fn test_jaccard_hac_clusterer_presets() {
         let tr = JaccardHacClusterer::topic_rank();
         assert!((tr.similarity_threshold - 0.25).abs() < 1e-10);
+        assert_eq!(tr.linkage, Linkage::Average);
 
         let mr = JaccardHacClusterer::multipartite_rank();
         assert!((mr.similarity_threshold - 0.26).abs() < 1e-10);
+        assert_eq!(mr.linkage, Linkage::Average);
+    }
+
+    #[test]
+    fn test_jaccard_hac_clusterer_with_linkage_constructor() {
+        let c = JaccardHacClusterer::with_linkage(0.30, Linkage::Single);
+        assert!((c.similarity_threshold - 0.30).abs() < 1e-10);
+        assert_eq!(c.linkage, Linkage::Single);
+
+        let c2 = JaccardHacClusterer::with_linkage(0.20, Linkage::Complete);
+        assert_eq!(c2.linkage, Linkage::Complete);
+    }
+
+    #[test]
+    fn test_jaccard_hac_clusterer_linkage_affects_clusters() {
+        // Build a chain: A↔B overlapping, B↔C overlapping, A↔C disjoint.
+        // Single linkage chains everything; complete does not.
+        let phrases = vec![
+            PhraseCandidate {
+                start_token: 0, end_token: 1, start_char: 0, end_char: 5,
+                sentence_idx: 0, lemma_ids: vec![0, 1, 2],
+                term_ids: vec![10, 11, 12],           // A
+            },
+            PhraseCandidate {
+                start_token: 2, end_token: 3, start_char: 6, end_char: 10,
+                sentence_idx: 0, lemma_ids: vec![1, 2, 3],
+                term_ids: vec![11, 12, 13],           // B — overlaps A
+            },
+            PhraseCandidate {
+                start_token: 4, end_token: 5, start_char: 11, end_char: 15,
+                sentence_idx: 0, lemma_ids: vec![3, 4, 5],
+                term_ids: vec![13, 14, 15],           // C — overlaps B but not A
+            },
+        ];
+        let cfg = TextRankConfig::default();
+
+        let single_clusterer = JaccardHacClusterer::with_linkage(0.25, Linkage::Single);
+        let complete_clusterer = JaccardHacClusterer::with_linkage(0.25, Linkage::Complete);
+
+        let cs = CandidateSet::from_kind(CandidateKind::Phrases(phrases));
+        let ca_single = single_clusterer.cluster(cs.as_ref(), &cfg);
+        let ca_complete = complete_clusterer.cluster(cs.as_ref(), &cfg);
+
+        // Single linkage should produce fewer or equal clusters.
+        assert!(ca_single.num_clusters() <= ca_complete.num_clusters());
     }
 
     #[test]
