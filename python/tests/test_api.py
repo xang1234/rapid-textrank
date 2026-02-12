@@ -371,5 +371,94 @@ class TestConvenienceFunction:
         assert isinstance(phrases, list)
 
 
+class TestMaxThreads:
+    """Tests for per-extractor thread pool via max_threads."""
+
+    SAMPLE_TEXT = (
+        "Machine learning is a subset of artificial intelligence. "
+        "Deep learning is a type of machine learning. "
+        "Neural networks are used in deep learning."
+    )
+
+    def test_max_threads_constructor(self):
+        """Create extractor with max_threads, verify getter."""
+        from rapid_textrank import BaseTextRank
+
+        extractor = BaseTextRank(top_n=5, max_threads=2)
+        assert extractor.max_threads == 2
+
+    def test_max_threads_none_by_default(self):
+        """Without max_threads, getter returns None (global pool)."""
+        from rapid_textrank import BaseTextRank
+
+        extractor = BaseTextRank(top_n=5)
+        assert extractor.max_threads is None
+
+    def test_max_threads_extraction(self):
+        """Extraction works correctly with a dedicated pool."""
+        from rapid_textrank import BaseTextRank
+
+        extractor = BaseTextRank(top_n=5, max_threads=2)
+        result = extractor.extract_keywords(self.SAMPLE_TEXT)
+
+        assert len(result.phrases) > 0
+        assert result.converged
+
+    def test_set_max_threads(self):
+        """Setter replaces the pool."""
+        from rapid_textrank import SingleRank
+
+        extractor = SingleRank(top_n=5)
+        assert extractor.max_threads is None
+
+        extractor.set_max_threads(3)
+        assert extractor.max_threads == 3
+
+        # Revert to global pool
+        extractor.set_max_threads(None)
+        assert extractor.max_threads is None
+
+    def test_max_threads_zero_rejected(self):
+        """max_threads=0 raises ValueError."""
+        from rapid_textrank import PositionRank
+
+        with pytest.raises(ValueError, match="max_threads must be >= 1"):
+            PositionRank(top_n=5, max_threads=0)
+
+    def test_set_max_threads_zero_rejected(self):
+        """set_max_threads(0) also raises ValueError."""
+        from rapid_textrank import BaseTextRank
+
+        extractor = BaseTextRank(top_n=5, max_threads=2)
+        with pytest.raises(ValueError, match="max_threads must be >= 1"):
+            extractor.set_max_threads(0)
+
+    def test_all_variants_support_max_threads(self):
+        """Every extractor class accepts max_threads."""
+        from rapid_textrank import (
+            BaseTextRank,
+            PositionRank,
+            BiasedTextRank,
+            SingleRank,
+            TopicalPageRank,
+            MultipartiteRank,
+        )
+
+        classes = [
+            lambda: BaseTextRank(top_n=3, max_threads=1),
+            lambda: PositionRank(top_n=3, max_threads=1),
+            lambda: BiasedTextRank(top_n=3, max_threads=1),
+            lambda: SingleRank(top_n=3, max_threads=1),
+            lambda: TopicalPageRank(top_n=3, max_threads=1),
+            lambda: MultipartiteRank(top_n=3, max_threads=1),
+        ]
+
+        for factory in classes:
+            ext = factory()
+            assert ext.max_threads == 1
+            result = ext.extract_keywords(self.SAMPLE_TEXT)
+            assert len(result.phrases) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

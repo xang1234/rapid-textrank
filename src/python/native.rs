@@ -14,6 +14,7 @@ use crate::variants::single_rank::SingleRank;
 use crate::variants::topical_pagerank::TopicalPageRank;
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A phrase extracted by TextRank
 #[pyclass(name = "Phrase")]
@@ -105,6 +106,36 @@ impl PyTextRankResult {
 #[pyo3(signature = (language = "en"))]
 pub fn get_stopwords(language: &str) -> PyResult<Vec<String>> {
     Ok(StopwordFilter::built_in_list(language))
+}
+
+/// Build an optional dedicated rayon thread pool.
+fn build_thread_pool(max_threads: Option<usize>) -> PyResult<Option<Arc<rayon::ThreadPool>>> {
+    match max_threads {
+        None => Ok(None),
+        Some(0) => Err(pyo3::exceptions::PyValueError::new_err(
+            "max_threads must be >= 1 (use None for the global pool)",
+        )),
+        Some(n) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to create thread pool: {}",
+                        e
+                    ))
+                })?;
+            Ok(Some(Arc::new(pool)))
+        }
+    }
+}
+
+/// Run a closure in the given pool, or on the global pool if `None`.
+fn run_in_pool<R: Send>(pool: &Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(p) => p.install(f),
+        None => f(),
+    }
 }
 
 /// Configuration for TextRank
@@ -227,16 +258,18 @@ impl PyTextRankConfig {
 #[pyclass(name = "BaseTextRank")]
 pub struct PyBaseTextRank {
     config: TextRankConfig,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PyBaseTextRank {
     #[new]
-    #[pyo3(signature = (config=None, top_n=None, language=None))]
+    #[pyo3(signature = (config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -249,6 +282,7 @@ impl PyBaseTextRank {
 
         Ok(Self {
             config: inner_config,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -261,22 +295,25 @@ impl PyBaseTextRank {
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
         let config = self.config.clone();
         let text = text.to_owned();
+        let pool = self.thread_pool.clone();
 
         // Release the GIL for CPU-intensive extraction.
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_sentences, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_sentences, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            extract_keyphrases_with_info(&tokens, &config)
+                extract_keyphrases_with_info(&tokens, &config)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -284,6 +321,19 @@ impl PyBaseTextRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    /// Get the number of threads in the dedicated pool, or None if using the global pool.
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    /// Replace the dedicated thread pool. Pass None to revert to the global pool.
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -298,16 +348,18 @@ impl PyBaseTextRank {
 #[pyclass(name = "PositionRank")]
 pub struct PyPositionRank {
     config: TextRankConfig,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PyPositionRank {
     #[new]
-    #[pyo3(signature = (config=None, top_n=None, language=None))]
+    #[pyo3(signature = (config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -320,6 +372,7 @@ impl PyPositionRank {
 
         Ok(Self {
             config: inner_config,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -328,21 +381,24 @@ impl PyPositionRank {
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
         let config = self.config.clone();
         let text = text.to_owned();
+        let pool = self.thread_pool.clone();
 
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            PositionRank::with_config(config).extract_with_info(&tokens)
+                PositionRank::with_config(config).extract_with_info(&tokens)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -350,6 +406,17 @@ impl PyPositionRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -366,18 +433,20 @@ pub struct PyBiasedTextRank {
     config: TextRankConfig,
     focus_terms: Vec<String>,
     bias_weight: f64,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PyBiasedTextRank {
     #[new]
-    #[pyo3(signature = (focus_terms=None, bias_weight=5.0, config=None, top_n=None, language=None))]
+    #[pyo3(signature = (focus_terms=None, bias_weight=5.0, config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         focus_terms: Option<Vec<String>>,
         bias_weight: f64,
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -392,6 +461,7 @@ impl PyBiasedTextRank {
             config: inner_config,
             focus_terms: focus_terms.unwrap_or_default(),
             bias_weight,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -417,25 +487,28 @@ impl PyBiasedTextRank {
         let text = text.to_owned();
         let focus_terms = self.focus_terms.clone();
         let bias_weight = self.bias_weight;
+        let pool = self.thread_pool.clone();
 
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            let focus_refs: Vec<&str> = focus_terms.iter().map(|s| s.as_str()).collect();
-            BiasedTextRank::with_config(config)
-                .with_focus(&focus_refs)
-                .with_bias_weight(bias_weight)
-                .extract_with_info(&tokens)
+                let focus_refs: Vec<&str> = focus_terms.iter().map(|s| s.as_str()).collect();
+                BiasedTextRank::with_config(config)
+                    .with_focus(&focus_refs)
+                    .with_bias_weight(bias_weight)
+                    .extract_with_info(&tokens)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -443,6 +516,17 @@ impl PyBiasedTextRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -460,16 +544,18 @@ impl PyBiasedTextRank {
 #[pyclass(name = "SingleRank")]
 pub struct PySingleRank {
     config: TextRankConfig,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PySingleRank {
     #[new]
-    #[pyo3(signature = (config=None, top_n=None, language=None))]
+    #[pyo3(signature = (config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -482,6 +568,7 @@ impl PySingleRank {
 
         Ok(Self {
             config: inner_config,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -490,21 +577,24 @@ impl PySingleRank {
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
         let config = self.config.clone();
         let text = text.to_owned();
+        let pool = self.thread_pool.clone();
 
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            SingleRank::with_config(config).extract_with_info(&tokens)
+                SingleRank::with_config(config).extract_with_info(&tokens)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -512,6 +602,17 @@ impl PySingleRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -532,18 +633,20 @@ pub struct PyTopicalPageRank {
     config: TextRankConfig,
     topic_weights: HashMap<String, f64>,
     min_weight: f64,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PyTopicalPageRank {
     #[new]
-    #[pyo3(signature = (topic_weights=None, min_weight=0.0, config=None, top_n=None, language=None))]
+    #[pyo3(signature = (topic_weights=None, min_weight=0.0, config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         topic_weights: Option<HashMap<String, f64>>,
         min_weight: f64,
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -558,6 +661,7 @@ impl PyTopicalPageRank {
             config: inner_config,
             topic_weights: topic_weights.unwrap_or_default(),
             min_weight,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -582,24 +686,27 @@ impl PyTopicalPageRank {
         let text = text.to_owned();
         let topic_weights = self.topic_weights.clone();
         let min_weight = self.min_weight;
+        let pool = self.thread_pool.clone();
 
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            TopicalPageRank::with_config(config)
-                .with_topic_weights(topic_weights)
-                .with_min_weight(min_weight)
-                .extract_with_info(&tokens)
+                TopicalPageRank::with_config(config)
+                    .with_topic_weights(topic_weights)
+                    .with_min_weight(min_weight)
+                    .extract_with_info(&tokens)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -607,6 +714,17 @@ impl PyTopicalPageRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -629,18 +747,20 @@ pub struct PyMultipartiteRank {
     config: TextRankConfig,
     similarity_threshold: f64,
     alpha: f64,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 #[pymethods]
 impl PyMultipartiteRank {
     #[new]
-    #[pyo3(signature = (similarity_threshold=0.26, alpha=1.1, config=None, top_n=None, language=None))]
+    #[pyo3(signature = (similarity_threshold=0.26, alpha=1.1, config=None, top_n=None, language=None, max_threads=None))]
     fn new(
         similarity_threshold: f64,
         alpha: f64,
         config: Option<PyTextRankConfig>,
         top_n: Option<usize>,
         language: Option<&str>,
+        max_threads: Option<usize>,
     ) -> PyResult<Self> {
         let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
 
@@ -655,6 +775,7 @@ impl PyMultipartiteRank {
             config: inner_config,
             similarity_threshold,
             alpha,
+            thread_pool: build_thread_pool(max_threads)?,
         })
     }
 
@@ -665,24 +786,27 @@ impl PyMultipartiteRank {
         let text = text.to_owned();
         let similarity_threshold = self.similarity_threshold;
         let alpha = self.alpha;
+        let pool = self.thread_pool.clone();
 
         let result = py.allow_threads(move || {
-            let tokenizer = Tokenizer::new();
-            let (_, mut tokens) = tokenizer.tokenize(&text);
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
 
-            let stopwords = if config.stopwords.is_empty() {
-                StopwordFilter::new(&config.language)
-            } else {
-                StopwordFilter::with_additional(&config.language, &config.stopwords)
-            };
-            for token in &mut tokens {
-                token.is_stopword = stopwords.is_stopword(&token.text);
-            }
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
 
-            MultipartiteRank::with_config(config)
-                .with_similarity_threshold(similarity_threshold)
-                .with_alpha(alpha)
-                .extract_with_info(&tokens)
+                MultipartiteRank::with_config(config)
+                    .with_similarity_threshold(similarity_threshold)
+                    .with_alpha(alpha)
+                    .extract_with_info(&tokens)
+            })
         });
 
         Ok(PyTextRankResult {
@@ -690,6 +814,17 @@ impl PyMultipartiteRank {
             converged: result.converged,
             iterations: result.iterations,
         })
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
