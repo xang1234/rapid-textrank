@@ -304,6 +304,7 @@ impl ValidationRule for RuntimeLimitsRule {
             ("max_tokens", spec.runtime.max_tokens),
             ("max_nodes", spec.runtime.max_nodes),
             ("max_edges", spec.runtime.max_edges),
+            ("max_threads", spec.runtime.max_threads),
         ];
 
         for &(field, value) in checks {
@@ -677,8 +678,27 @@ mod tests {
             r#"{
                 "v": 1,
                 "strict": true,
-                "runtime": { "max_threads": 8 }
+                "runtime": { "bogus_runtime_field": 42 }
             }"#,
+        ));
+        assert!(report.has_errors());
+        let errs: Vec<_> = report.errors().collect();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].path.contains("bogus_runtime_field"));
+    }
+
+    #[test]
+    fn test_max_threads_valid() {
+        let report = engine().validate(&spec(
+            r#"{ "v": 1, "strict": true, "runtime": { "max_threads": 8 } }"#,
+        ));
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn test_max_threads_zero_fails() {
+        let report = engine().validate(&spec(
+            r#"{ "v": 1, "runtime": { "max_threads": 0 } }"#,
         ));
         assert!(report.has_errors());
         let errs: Vec<_> = report.errors().collect();

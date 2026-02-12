@@ -164,7 +164,7 @@ pub enum RankModuleType {
     PersonalizedPagerank,
 }
 
-/// Runtime execution limits (fail-fast guards).
+/// Runtime execution limits and threading controls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeSpec {
     /// Maximum number of input tokens before rejecting.
@@ -179,9 +179,59 @@ pub struct RuntimeSpec {
     #[serde(default)]
     pub max_edges: Option<usize>,
 
+    /// Maximum number of Rayon threads for parallel work.
+    /// `None` uses Rayon's default (all logical cores).
+    #[serde(default)]
+    pub max_threads: Option<usize>,
+
+    /// Disable parallelism entirely (equivalent to `max_threads: 1`).
+    /// When `true`, overrides `max_threads`.
+    #[serde(default)]
+    pub single_thread: bool,
+
     /// Captures any fields not recognized by the schema.
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, serde_json::Value>,
+}
+
+impl RuntimeSpec {
+    /// Resolve the effective thread count.
+    ///
+    /// - `single_thread == true` → `Some(1)`
+    /// - `max_threads == Some(n)` → `Some(n)`
+    /// - otherwise → `None` (use Rayon default)
+    pub fn effective_threads(&self) -> Option<usize> {
+        if self.single_thread {
+            Some(1)
+        } else {
+            self.max_threads
+        }
+    }
+
+    /// Build a scoped Rayon thread pool matching this config.
+    ///
+    /// Returns `None` when no thread limit is set (use global pool).
+    pub fn build_thread_pool(&self) -> Option<rayon::ThreadPool> {
+        self.effective_threads().map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .expect("failed to build Rayon thread pool")
+        })
+    }
+
+    /// Execute `f` within a scoped Rayon thread pool matching this config.
+    ///
+    /// If no thread limit is set, `f` runs directly (using the global pool).
+    /// Otherwise, a custom pool is created and `f` runs inside
+    /// [`rayon::ThreadPool::install`], so any `par_iter()` within `f`
+    /// uses the scoped pool.
+    pub fn scoped<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        match self.build_thread_pool() {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +291,100 @@ mod tests {
         let back = serde_json::to_value(&spec).unwrap();
         assert_eq!(back["modules"]["rank"], "personalized_pagerank");
         assert_eq!(back["modules"]["teleport"], "focus_terms");
+    }
+
+    // ─── RuntimeSpec threading ──────────────────────────────────────
+
+    #[test]
+    fn test_effective_threads_default() {
+        let rt = RuntimeSpec::default();
+        assert_eq!(rt.effective_threads(), None);
+    }
+
+    #[test]
+    fn test_effective_threads_max_threads() {
+        let rt = RuntimeSpec {
+            max_threads: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(rt.effective_threads(), Some(4));
+    }
+
+    #[test]
+    fn test_effective_threads_single_thread_overrides() {
+        let rt = RuntimeSpec {
+            max_threads: Some(8),
+            single_thread: true,
+            ..Default::default()
+        };
+        assert_eq!(rt.effective_threads(), Some(1));
+    }
+
+    #[test]
+    fn test_build_thread_pool_none_when_default() {
+        let rt = RuntimeSpec::default();
+        assert!(rt.build_thread_pool().is_none());
+    }
+
+    #[test]
+    fn test_build_thread_pool_some_when_configured() {
+        let rt = RuntimeSpec {
+            max_threads: Some(2),
+            ..Default::default()
+        };
+        let pool = rt.build_thread_pool();
+        assert!(pool.is_some());
+        assert_eq!(pool.unwrap().current_num_threads(), 2);
+    }
+
+    #[test]
+    fn test_build_thread_pool_single_thread() {
+        let rt = RuntimeSpec {
+            single_thread: true,
+            ..Default::default()
+        };
+        let pool = rt.build_thread_pool();
+        assert!(pool.is_some());
+        assert_eq!(pool.unwrap().current_num_threads(), 1);
+    }
+
+    #[test]
+    fn test_scoped_runs_in_pool() {
+        let rt = RuntimeSpec {
+            max_threads: Some(2),
+            ..Default::default()
+        };
+        let thread_count = rt.scoped(|| rayon::current_num_threads());
+        assert_eq!(thread_count, 2);
+    }
+
+    #[test]
+    fn test_scoped_default_uses_global() {
+        let rt = RuntimeSpec::default();
+        // Should run without error; uses global pool
+        let result = rt.scoped(|| 42);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_deserialize_runtime_threading() {
+        let json = r#"{
+            "v": 1,
+            "runtime": { "max_threads": 4, "single_thread": false }
+        }"#;
+        let spec: PipelineSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.runtime.max_threads, Some(4));
+        assert!(!spec.runtime.single_thread);
+    }
+
+    #[test]
+    fn test_deserialize_runtime_single_thread() {
+        let json = r#"{
+            "v": 1,
+            "runtime": { "single_thread": true }
+        }"#;
+        let spec: PipelineSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.runtime.single_thread);
+        assert_eq!(spec.runtime.effective_threads(), Some(1));
     }
 }
