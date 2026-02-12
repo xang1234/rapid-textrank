@@ -146,7 +146,15 @@ impl PhraseExtractor {
             groups.entry(key).or_default().push(chunk);
         }
 
-        groups
+        let groups_iter: Vec<_> = if self.config.determinism.is_deterministic() {
+            let mut sorted: Vec<_> = groups.into_iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sorted
+        } else {
+            groups.into_iter().collect()
+        };
+
+        groups_iter
             .into_iter()
             .map(|(group_key, variants)| {
                 let mut offsets = Vec::new();
@@ -162,7 +170,11 @@ impl PhraseExtractor {
                         }
                         let canonical = variant_counts
                             .into_iter()
-                            .max_by_key(|(_, count)| *count)
+                            .max_by(|(text_a, count_a), (text_b, count_b)| {
+                                count_a
+                                    .cmp(count_b)
+                                    .then_with(|| text_b.cmp(text_a))
+                            })
                             .map(|(text, _)| text)
                             .unwrap_or_else(|| group_key.clone());
                         (canonical, group_key)
@@ -294,7 +306,7 @@ pub fn extract_keyphrases_with_info(tokens: &[Token], config: &TextRankConfig) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PosTag;
+    use crate::types::{ChunkSpan, DeterminismMode, PosTag};
 
     fn make_tokens() -> Vec<Token> {
         vec![
@@ -554,5 +566,100 @@ mod tests {
         assert_eq!(result.iterations, 1);
         // Should still produce phrases (just with less-converged scores).
         assert!(!result.phrases.is_empty());
+    }
+
+    // ================================================================
+    // Determinism tests
+    // ================================================================
+
+    /// When two surface-form variants of the same lemma appear with equal
+    /// frequency, the canonical text must be chosen deterministically
+    /// (lexicographically smallest wins).
+    #[test]
+    fn test_canonical_form_tie_breaks_lexicographically() {
+        fn chunk(start: usize) -> ChunkSpan {
+            ChunkSpan {
+                start_token: start,
+                end_token: start + 1,
+                start_char: start * 10,
+                end_char: start * 10 + 5,
+                sentence_idx: 0,
+            }
+        }
+
+        // Two variants of lemma "network": "Networks" and "networks", each appearing once.
+        let scored = vec![
+            ScoredChunk {
+                chunk: chunk(0),
+                score: 1.0,
+                text: "Networks".to_string(),
+                lemma: "network".to_string(),
+            },
+            ScoredChunk {
+                chunk: chunk(1),
+                score: 1.0,
+                text: "networks".to_string(),
+                lemma: "network".to_string(),
+            },
+        ];
+
+        let config = TextRankConfig {
+            phrase_grouping: PhraseGrouping::Lemma,
+            ..TextRankConfig::default()
+        };
+        let extractor = PhraseExtractor::with_config(config);
+        let phrases = extractor.group_phrases(scored);
+
+        assert_eq!(phrases.len(), 1);
+        // Lexicographically smaller "Networks" < "networks" (uppercase < lowercase)
+        assert_eq!(phrases[0].text, "Networks");
+    }
+
+    /// In deterministic mode, group_phrases produces groups in sorted key order.
+    #[test]
+    fn test_group_phrases_deterministic_key_order() {
+        fn chunk(start: usize, sentence: usize) -> ChunkSpan {
+            ChunkSpan {
+                start_token: start,
+                end_token: start + 1,
+                start_char: start * 10,
+                end_char: start * 10 + 5,
+                sentence_idx: sentence,
+            }
+        }
+
+        // Three different lemmas: "zebra", "alpha", "middle"
+        let scored = vec![
+            ScoredChunk {
+                chunk: chunk(0, 0),
+                score: 1.0,
+                text: "zebra".to_string(),
+                lemma: "zebra".to_string(),
+            },
+            ScoredChunk {
+                chunk: chunk(1, 0),
+                score: 1.0,
+                text: "alpha".to_string(),
+                lemma: "alpha".to_string(),
+            },
+            ScoredChunk {
+                chunk: chunk(2, 0),
+                score: 1.0,
+                text: "middle".to_string(),
+                lemma: "middle".to_string(),
+            },
+        ];
+
+        let config = TextRankConfig {
+            phrase_grouping: PhraseGrouping::Lemma,
+            determinism: DeterminismMode::Deterministic,
+            ..TextRankConfig::default()
+        };
+        let extractor = PhraseExtractor::with_config(config);
+        let phrases = extractor.group_phrases(scored);
+
+        // In deterministic mode, groups are sorted by lemma key
+        let lemmas: Vec<&str> = phrases.iter().map(|p| p.lemma.as_str()).collect();
+        assert_eq!(lemmas, vec!["alpha", "middle", "zebra"]);
     }
 }

@@ -155,8 +155,16 @@ impl MultipartiteRank {
                 .push(i);
         }
 
-        let mut phrases: Vec<Phrase> = lemma_indices
-            .into_values()
+        let lemma_groups: Vec<Vec<usize>> = if self.config.determinism.is_deterministic() {
+            let mut sorted: Vec<_> = lemma_indices.into_iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sorted.into_iter().map(|(_, v)| v).collect()
+        } else {
+            lemma_indices.into_values().collect()
+        };
+
+        let mut phrases: Vec<Phrase> = lemma_groups
+            .into_iter()
             .map(|indices| {
                 let best_idx = *indices
                     .iter()
