@@ -6,8 +6,8 @@
 
 use crate::pipeline::artifacts::{
     CandidateKind, CandidateSet, CandidateSetRef, ClusterAssignments, DebugPayload,
-    FormattedResult, Graph, PhraseCandidate, PhraseEntry, PhraseSet, RankOutput, TeleportType,
-    TeleportVector, TokenStream, TokenStreamRef, WordCandidate,
+    FormattedResult, Graph, PhraseCandidate, PhraseEntry, PhraseSet, RankOutput,
+    SentenceCandidate, TeleportType, TeleportVector, TokenStream, TokenStreamRef, WordCandidate,
 };
 use crate::types::{ChunkSpan, PosTag, TextRankConfig};
 use serde::{Deserialize, Serialize};
@@ -2023,6 +2023,96 @@ impl<C: Clusterer> GraphBuilder for CandidateGraphBuilder<C> {
         let mut graph = Graph::from_builder(&builder);
         graph.set_cluster_assignments(assignments);
         graph
+    }
+}
+
+// ============================================================================
+// SentenceGraphBuilder — Jaccard-similarity sentence graph (stage 2, sentence)
+// ============================================================================
+
+/// Builds a graph where each sentence is a node and edges are weighted by the
+/// Jaccard similarity of the sentences' lemma sets.
+///
+/// Used for extractive summarization (SentenceRank).  The builder:
+///
+/// 1. Extracts the `Sentences` variant from the candidate set (returns an empty
+///    graph for other candidate kinds).
+/// 2. Converts each sentence's `lemma_ids` to an `FxHashSet<u32>` for
+///    set-based Jaccard computation.
+/// 3. Creates one node per sentence (`"s_0"`, `"s_1"`, ...).
+/// 4. For all pairs `(i, j)` where `i < j`, computes
+///    `similarity = 1.0 - jaccard_distance_u32(set_i, set_j)`.
+///    If the similarity exceeds `min_similarity`, an undirected edge is added.
+/// 5. Wraps the result via `Graph::from_builder()`.
+///
+/// # Configuration
+///
+/// - `min_similarity` (default `0.0`): edges with similarity ≤ this threshold
+///   are omitted.  At the default value any non-zero overlap produces an edge.
+#[derive(Debug, Clone, Copy)]
+pub struct SentenceGraphBuilder {
+    pub min_similarity: f64,
+}
+
+impl Default for SentenceGraphBuilder {
+    fn default() -> Self {
+        Self { min_similarity: 0.0 }
+    }
+}
+
+impl SentenceGraphBuilder {
+    /// Set the minimum Jaccard similarity for an edge to be created.
+    /// Clamped to `[0.0, 1.0]`.
+    pub fn with_min_similarity(mut self, threshold: f64) -> Self {
+        self.min_similarity = threshold.clamp(0.0, 1.0);
+        self
+    }
+}
+
+impl GraphBuilder for SentenceGraphBuilder {
+    fn build(
+        &self,
+        _tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        _cfg: &TextRankConfig,
+    ) -> Graph {
+        use crate::clustering::jaccard_distance_u32;
+        use rustc_hash::FxHashSet;
+
+        // Only operate on sentence candidates.
+        let sentences = match candidates.kind() {
+            CandidateKind::Sentences(s) => s,
+            _ => return Graph::empty(),
+        };
+
+        let n = sentences.len();
+        if n == 0 {
+            return Graph::empty();
+        }
+
+        // --- 1. Pre-compute lemma sets for Jaccard ---
+        let lemma_sets: Vec<FxHashSet<u32>> = sentences
+            .iter()
+            .map(|s| s.lemma_ids.iter().copied().collect())
+            .collect();
+
+        // --- 2. Create one node per sentence ---
+        let mut builder = crate::graph::builder::GraphBuilder::with_capacity(n);
+        for i in 0..n {
+            builder.get_or_create_node(&format!("s_{}", i));
+        }
+
+        // --- 3. Pairwise Jaccard similarity edges ---
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let similarity = 1.0 - jaccard_distance_u32(&lemma_sets[i], &lemma_sets[j]);
+                if similarity > self.min_similarity {
+                    builder.set_edge(i as u32, j as u32, similarity);
+                }
+            }
+        }
+
+        Graph::from_builder(&builder)
     }
 }
 
@@ -7189,6 +7279,113 @@ mod tests {
                 assert!(w <= 1.0, "Edge weight should be <= 1.0 (gap >= 1)");
             }
         }
+    }
+
+    // ================================================================
+    // SentenceGraphBuilder tests
+    // ================================================================
+
+    /// Helper: build a sentence CandidateSet from raw lemma-ID vectors.
+    fn make_sentence_candidates(lemma_vecs: Vec<Vec<u32>>) -> CandidateSet {
+        let sentences: Vec<SentenceCandidate> = lemma_vecs
+            .into_iter()
+            .enumerate()
+            .map(|(i, ids)| SentenceCandidate {
+                sentence_idx: i as u32,
+                start_token: (i * 10) as u32,
+                end_token: (i * 10 + 5) as u32,
+                start_char: (i * 100) as u32,
+                end_char: (i * 100 + 50) as u32,
+                lemma_ids: ids,
+            })
+            .collect();
+        CandidateSet::from_kind(CandidateKind::Sentences(sentences))
+    }
+
+    #[test]
+    fn test_sentence_graph_builder_basic() {
+        // 3 sentences with known overlaps:
+        //   s0 = {1, 2, 3}
+        //   s1 = {2, 3, 4}       overlap with s0: {2,3} → J = 2/4 = 0.5
+        //   s2 = {5, 6}          disjoint from s0, s1 → J = 0
+        let candidates = make_sentence_candidates(vec![
+            vec![1, 2, 3],
+            vec![2, 3, 4],
+            vec![5, 6],
+        ]);
+        let tokens: Vec<Token> = Vec::new();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let builder = SentenceGraphBuilder::default();
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 3);
+        // Only one pair (s0, s1) has non-zero Jaccard similarity.
+        assert_eq!(graph.num_edges(), 2); // 1 undirected = 2 directed
+
+        // Check the edge weight between s0 and s1.
+        let weight_01: f64 = graph.neighbors(0).find(|(nb, _)| *nb == 1).map(|(_, w)| w).unwrap();
+        assert!((weight_01 - 0.5).abs() < 1e-10, "Expected 0.5, got {weight_01}");
+    }
+
+    #[test]
+    fn test_sentence_graph_builder_threshold() {
+        // Same 3 sentences, but min_similarity=0.6 should filter the 0.5-edge.
+        let candidates = make_sentence_candidates(vec![
+            vec![1, 2, 3],
+            vec![2, 3, 4],
+            vec![5, 6],
+        ]);
+        let tokens: Vec<Token> = Vec::new();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let builder = SentenceGraphBuilder::default().with_min_similarity(0.6);
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 3);
+        // 0.5 ≤ 0.6 → edge is filtered out.
+        assert_eq!(graph.num_edges(), 0);
+    }
+
+    #[test]
+    fn test_sentence_graph_builder_empty() {
+        let candidates = make_sentence_candidates(vec![]);
+        let tokens: Vec<Token> = Vec::new();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let builder = SentenceGraphBuilder::default();
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+        assert!(graph.is_empty());
+    }
+
+    #[test]
+    fn test_sentence_graph_builder_single() {
+        let candidates = make_sentence_candidates(vec![vec![1, 2, 3]]);
+        let tokens: Vec<Token> = Vec::new();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let builder = SentenceGraphBuilder::default();
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+
+        assert_eq!(graph.num_nodes(), 1);
+        assert_eq!(graph.num_edges(), 0);
+    }
+
+    #[test]
+    fn test_sentence_graph_builder_wrong_kind() {
+        // Word candidates → should return empty graph.
+        let tokens = topic_test_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+        let candidates = WordNodeSelector.select(stream.as_ref(), &cfg);
+
+        let builder = SentenceGraphBuilder::default();
+        let graph = builder.build(stream.as_ref(), candidates.as_ref(), &cfg);
+        assert!(graph.is_empty());
     }
 
     // ================================================================

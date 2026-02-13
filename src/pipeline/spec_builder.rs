@@ -28,7 +28,7 @@ use crate::pipeline::spec::{
 };
 use crate::pipeline::validation::ValidationEngine;
 use crate::pipeline::traits::{
-    CandidateGraphBuilder, CandidateSelector, ChunkPhraseBuilder, Clusterer,
+    CandidateGraphBuilder, CandidateSelector, ChunkPhraseBuilder, Clusterer, SentenceGraphBuilder,
     EdgeWeightPolicy, FocusTermsTeleportBuilder, GraphBuilder, GraphTransform,
     JaccardHacClusterer, MultipartitePhraseBuilder, MultipartiteTransform, NoopGraphTransform,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
@@ -224,6 +224,13 @@ impl SpecPipelineBuilder {
             Some(GraphSpec::CandidateGraph) => {
                 let clust_spec = clustering_spec.as_ref().unwrap();
                 Box::new(CandidateGraphBuilder::new(make_clusterer(clust_spec)))
+            }
+            Some(GraphSpec::SentenceGraph { min_similarity }) => {
+                let mut b = SentenceGraphBuilder::default();
+                if let Some(ms) = min_similarity {
+                    b = b.with_min_similarity(*ms);
+                }
+                Box::new(b)
             }
         };
 

@@ -350,7 +350,7 @@ pub fn build_capabilities() -> CapabilitiesResponse {
     let mut modules = HashMap::new();
     modules.insert("preprocess".into(), vec!["default".into()]);
     modules.insert("candidates".into(), vec!["word_nodes".into(), "phrase_candidates".into(), "sentence_candidates".into()]);
-    modules.insert("graph".into(), vec!["cooccurrence_window".into(), "topic_graph".into(), "candidate_graph".into()]);
+    modules.insert("graph".into(), vec!["cooccurrence_window".into(), "topic_graph".into(), "candidate_graph".into(), "sentence_graph".into()]);
     modules.insert("graph_transforms".into(), vec!["remove_intra_cluster_edges".into(), "alpha_boost".into()]);
     modules.insert("teleport".into(), vec!["uniform".into(), "position".into(), "focus_terms".into(), "topic_weights".into()]);
     modules.insert("clustering".into(), vec!["hac".into()]);

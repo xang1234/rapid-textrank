@@ -403,6 +403,11 @@ pub enum GraphSpec {
     TopicGraph,
     /// Candidate-level graph with inter-cluster edges (MultipartiteRank).
     CandidateGraph,
+    /// Sentence-level graph with Jaccard-similarity edges (SentenceRank).
+    SentenceGraph {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_similarity: Option<f64>,
+    },
 }
 
 impl GraphSpec {
@@ -416,6 +421,7 @@ impl GraphSpec {
             Self::CooccurrenceWindow { .. } => "cooccurrence_window",
             Self::TopicGraph => "topic_graph",
             Self::CandidateGraph => "candidate_graph",
+            Self::SentenceGraph { .. } => "sentence_graph",
         }
     }
 
@@ -434,6 +440,12 @@ impl GraphSpec {
                 window_size: window_size.or(*fb_ws),
                 cross_sentence: cross_sentence.or(*fb_cs),
                 edge_weighting: edge_weighting.clone().or(fb_ew.clone()),
+            },
+            (
+                Self::SentenceGraph { min_similarity },
+                Self::SentenceGraph { min_similarity: fb_ms },
+            ) => Self::SentenceGraph {
+                min_similarity: min_similarity.or(*fb_ms),
             },
             // Different variants — user wins entirely.
             _ => self.clone(),
@@ -1396,6 +1408,10 @@ mod tests {
         assert_eq!(CandidatesSpec::SentenceCandidates.type_name(), "sentence_candidates");
         assert_eq!(GraphSpec::TopicGraph.type_name(), "topic_graph");
         assert_eq!(GraphSpec::CandidateGraph.type_name(), "candidate_graph");
+        assert_eq!(
+            GraphSpec::SentenceGraph { min_similarity: None }.type_name(),
+            "sentence_graph"
+        );
         assert_eq!(
             GraphSpec::CooccurrenceWindow {
                 window_size: None,
