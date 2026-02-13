@@ -17,7 +17,7 @@
 //! Use [`Pipeline::base_textrank()`] (and friends) to build pipelines for
 //! known algorithm variants without spelling out the generics manually.
 
-use crate::pipeline::artifacts::{DebugLevel, FormattedResult, TokenStream};
+use crate::pipeline::artifacts::{DebugLevel, FormattedResult, PipelineWorkspace, TokenStream};
 use crate::pipeline::observer::{
     PipelineObserver, StageClock, StageReport, StageReportBuilder, STAGE_CANDIDATES, STAGE_FORMAT,
     STAGE_GRAPH, STAGE_GRAPH_TRANSFORM, STAGE_PHRASES, STAGE_PREPROCESS, STAGE_RANK,
@@ -429,9 +429,57 @@ where
     /// [`NoopObserver`] for zero-overhead execution.
     pub fn run(
         &self,
+        tokens: TokenStream,
+        cfg: &TextRankConfig,
+        observer: &mut impl PipelineObserver,
+    ) -> FormattedResult {
+        self.run_inner(tokens, cfg, observer, None)
+    }
+
+    /// Execute the pipeline, reusing workspace buffers for PageRank.
+    ///
+    /// Same as [`run`](Self::run) but uses the provided
+    /// [`PipelineWorkspace`] to avoid per-document allocations in the
+    /// ranking stage. Call [`PipelineWorkspace::clear()`] between
+    /// invocations (or use [`run_batch`](Self::run_batch) which does
+    /// this automatically).
+    pub fn run_with_workspace(
+        &self,
+        tokens: TokenStream,
+        cfg: &TextRankConfig,
+        observer: &mut impl PipelineObserver,
+        ws: &mut PipelineWorkspace,
+    ) -> FormattedResult {
+        self.run_inner(tokens, cfg, observer, Some(ws))
+    }
+
+    /// Execute the pipeline over multiple documents, reusing a single
+    /// workspace across all of them.
+    ///
+    /// Equivalent to calling [`run`](Self::run) on each document
+    /// individually, but avoids repeated PageRank buffer allocations.
+    pub fn run_batch(
+        &self,
+        docs: impl IntoIterator<Item = TokenStream>,
+        cfg: &TextRankConfig,
+        observer: &mut impl PipelineObserver,
+    ) -> Vec<FormattedResult> {
+        let mut ws = PipelineWorkspace::new();
+        docs.into_iter()
+            .map(|tokens| {
+                ws.clear();
+                self.run_with_workspace(tokens, cfg, observer, &mut ws)
+            })
+            .collect()
+    }
+
+    /// Shared orchestration logic for [`run`] and [`run_with_workspace`].
+    fn run_inner(
+        &self,
         mut tokens: TokenStream,
         cfg: &TextRankConfig,
         observer: &mut impl PipelineObserver,
+        ws: Option<&mut PipelineWorkspace>,
     ) -> FormattedResult {
         // Stage 0: Preprocess
         trace_stage!(STAGE_PREPROCESS);
@@ -488,7 +536,10 @@ where
         trace_stage!(STAGE_RANK);
         observer.on_stage_start(STAGE_RANK);
         let clock = StageClock::start();
-        let rank_output = self.ranker.rank(&graph, teleport.as_ref(), cfg);
+        let rank_output = match ws {
+            Some(ws) => self.ranker.rank_reusing(&graph, teleport.as_ref(), cfg, ws),
+            None => self.ranker.rank(&graph, teleport.as_ref(), cfg),
+        };
         let report = StageReportBuilder::new(clock.elapsed())
             .iterations(rank_output.iterations())
             .converged(rank_output.converged())
@@ -2419,5 +2470,83 @@ mod tests {
             debug.cluster_memberships.is_none(),
             "Base pipeline has no clusters — cluster_memberships should be None",
         );
+    }
+
+    // ================================================================
+    // run_with_workspace / run_batch tests
+    // ================================================================
+
+    #[test]
+    fn test_run_with_workspace_matches_run() {
+        let pipeline = BaseTextRankPipeline::base_textrank();
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        let result_normal = pipeline.run(make_token_stream(), &cfg, &mut obs);
+
+        let mut ws = crate::pipeline::artifacts::PipelineWorkspace::new();
+        let result_ws = pipeline.run_with_workspace(make_token_stream(), &cfg, &mut obs, &mut ws);
+
+        assert_eq!(result_normal.phrases.len(), result_ws.phrases.len());
+        assert_eq!(result_normal.converged, result_ws.converged);
+        for (a, b) in result_normal.phrases.iter().zip(result_ws.phrases.iter()) {
+            assert_eq!(a.text, b.text);
+            assert!(
+                (a.score - b.score).abs() < 1e-12,
+                "phrase '{}' score mismatch: {} vs {}",
+                a.text,
+                a.score,
+                b.score,
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_batch_matches_sequential_runs() {
+        let pipeline = BaseTextRankPipeline::base_textrank();
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        // Run individually first (consuming token streams).
+        let seq_0 = pipeline.run(make_token_stream(), &cfg, &mut obs);
+        let seq_1 = pipeline.run(TokenStream::from_tokens(&golden_tokens()), &cfg, &mut obs);
+        let seq_2 = pipeline.run(make_token_stream(), &cfg, &mut obs);
+        let sequential = [seq_0, seq_1, seq_2];
+
+        // Now run as batch (fresh token streams).
+        let batch = pipeline.run_batch(
+            vec![
+                make_token_stream(),
+                TokenStream::from_tokens(&golden_tokens()),
+                make_token_stream(),
+            ],
+            &cfg,
+            &mut obs,
+        );
+
+        assert_eq!(sequential.len(), batch.len());
+        for (seq, bat) in sequential.iter().zip(batch.iter()) {
+            assert_eq!(seq.phrases.len(), bat.phrases.len());
+            for (a, b) in seq.phrases.iter().zip(bat.phrases.iter()) {
+                assert_eq!(a.text, b.text);
+                assert!(
+                    (a.score - b.score).abs() < 1e-12,
+                    "phrase '{}' score mismatch: {} vs {}",
+                    a.text,
+                    a.score,
+                    b.score,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_batch_empty_docs() {
+        let pipeline = BaseTextRankPipeline::base_textrank();
+        let cfg = TextRankConfig::default();
+        let mut obs = NoopObserver;
+
+        let result = pipeline.run_batch(std::iter::empty(), &cfg, &mut obs);
+        assert!(result.is_empty());
     }
 }

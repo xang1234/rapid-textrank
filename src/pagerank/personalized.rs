@@ -143,6 +143,74 @@ impl PersonalizedPageRank {
         PageRankResult::new(scores, iterations, delta, delta <= self.threshold)
     }
 
+    /// Run Personalized PageRank, reusing externally-owned score buffers.
+    ///
+    /// Identical to [`run`](Self::run) but writes into the provided `score_buf`
+    /// and `norm_buf` instead of allocating fresh vectors. The final scores are
+    /// **cloned** into the returned [`PageRankResult`], so the caller retains
+    /// buffer capacity for the next invocation.
+    pub fn run_reusing(
+        &self,
+        graph: &CsrGraph,
+        score_buf: &mut Vec<f64>,
+        norm_buf: &mut Vec<f64>,
+    ) -> PageRankResult {
+        let n = graph.num_nodes;
+        if n == 0 {
+            return PageRankResult::new(vec![], 0, 0.0, true);
+        }
+
+        let personalization = self.prepare_personalization(n);
+
+        let initial_score = 1.0 / n as f64;
+        score_buf.clear();
+        score_buf.resize(n, initial_score);
+        norm_buf.clear();
+        norm_buf.resize(n, 0.0);
+
+        let dangling_nodes = graph.dangling_nodes();
+        let mut iterations = 0;
+        let mut delta = f64::MAX;
+
+        while iterations < self.max_iterations && delta > self.threshold {
+            iterations += 1;
+
+            let dangling_mass: f64 = dangling_nodes.iter().map(|&d| score_buf[d as usize]).sum();
+
+            for i in 0..n {
+                norm_buf[i] = (1.0 - self.damping) * personalization[i]
+                    + self.damping * dangling_mass * personalization[i];
+            }
+
+            for (node, &node_score) in score_buf.iter().enumerate() {
+                let total_weight = graph.node_total_weight(node as u32);
+                if total_weight > 0.0 {
+                    for (neighbor, weight) in graph.neighbors(node as u32) {
+                        let contribution = self.damping * node_score * weight / total_weight;
+                        norm_buf[neighbor as usize] += contribution;
+                    }
+                }
+            }
+
+            delta = score_buf
+                .iter()
+                .zip(norm_buf.iter())
+                .map(|(old, new)| (old - new).abs())
+                .sum();
+
+            std::mem::swap(score_buf, norm_buf);
+        }
+
+        let sum: f64 = score_buf.iter().sum();
+        if sum > 0.0 {
+            for score in score_buf.iter_mut() {
+                *score /= sum;
+            }
+        }
+
+        PageRankResult::new(score_buf.clone(), iterations, delta, delta <= self.threshold)
+    }
+
     /// Prepare and normalize the personalization vector
     fn prepare_personalization(&self, n: usize) -> Vec<f64> {
         match &self.personalization {
@@ -309,6 +377,24 @@ mod tests {
 
         // Node A should have higher score due to bias
         assert!(result.scores[0] > result.scores[2]);
+    }
+
+    #[test]
+    fn test_run_reusing_matches_run() {
+        let graph = build_line_graph();
+        let ppr = PersonalizedPageRank::new().with_personalization(vec![5.0, 1.0, 3.0]);
+
+        let result_normal = ppr.run(&graph);
+
+        let mut score_buf = Vec::new();
+        let mut norm_buf = Vec::new();
+        let result_reusing = ppr.run_reusing(&graph, &mut score_buf, &mut norm_buf);
+
+        assert_eq!(result_normal.iterations, result_reusing.iterations);
+        assert_eq!(result_normal.converged, result_reusing.converged);
+        for (a, b) in result_normal.scores.iter().zip(result_reusing.scores.iter()) {
+            assert!((a - b).abs() < 1e-12, "score mismatch: {a} vs {b}");
+        }
     }
 
     #[test]

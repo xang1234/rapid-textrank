@@ -1443,6 +1443,22 @@ pub trait Ranker {
         teleport: Option<&TeleportVector>,
         cfg: &TextRankConfig,
     ) -> RankOutput;
+
+    /// Rank nodes, reusing workspace buffers for PageRank score vectors.
+    ///
+    /// The default implementation ignores the workspace and delegates to
+    /// [`rank`](Self::rank). Override this in rankers that can benefit from
+    /// buffer reuse (e.g., [`PageRankRanker`]).
+    fn rank_reusing(
+        &self,
+        graph: &Graph,
+        teleport: Option<&TeleportVector>,
+        cfg: &TextRankConfig,
+        ws: &mut crate::pipeline::artifacts::PipelineWorkspace,
+    ) -> RankOutput {
+        let _ = ws;
+        self.rank(graph, teleport, cfg)
+    }
 }
 
 /// PageRank-based ranker — the default (and currently only) [`Ranker`]
@@ -1496,6 +1512,37 @@ impl Ranker for PageRankRanker {
                     .with_threshold(cfg.convergence_threshold)
                     .with_personalization(tv.as_slice().to_vec())
                     .run(csr)
+            }
+        };
+
+        RankOutput::from_pagerank_result(&result)
+    }
+
+    fn rank_reusing(
+        &self,
+        graph: &Graph,
+        teleport: Option<&TeleportVector>,
+        cfg: &TextRankConfig,
+        ws: &mut crate::pipeline::artifacts::PipelineWorkspace,
+    ) -> RankOutput {
+        let csr = graph.csr();
+
+        let result = match teleport {
+            None => {
+                crate::pagerank::standard::StandardPageRank {
+                    damping: cfg.damping,
+                    max_iterations: cfg.max_iterations,
+                    threshold: cfg.convergence_threshold,
+                }
+                .run_reusing(csr, &mut ws.score_buf, &mut ws.norm_buf)
+            }
+            Some(tv) => {
+                crate::pagerank::personalized::PersonalizedPageRank::new()
+                    .with_damping(cfg.damping)
+                    .with_max_iterations(cfg.max_iterations)
+                    .with_threshold(cfg.convergence_threshold)
+                    .with_personalization(tv.as_slice().to_vec())
+                    .run_reusing(csr, &mut ws.score_buf, &mut ws.norm_buf)
             }
         };
 
