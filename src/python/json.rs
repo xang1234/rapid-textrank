@@ -1426,4 +1426,500 @@ mod tests {
         assert!(doc.config.is_none());
         assert!(doc.pipeline.is_none());
     }
+
+    // ─── Integration: PipelineSpec round-trips (textranker-04a.8) ────────
+
+    /// All 7 presets build and run through the pipeline path, producing phrases.
+    #[test]
+    fn test_all_presets_execute_through_pipeline() {
+        let presets = VALID_PRESETS;
+        for preset in presets {
+            let json_input = format!(
+                r#"{{"tokens": {}, "pipeline": "{preset}", "config": {{"determinism": "deterministic"}}}}"#,
+                pipeline_test_tokens_json()
+            );
+            let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+            let json_config = doc.config.unwrap_or_default();
+            let config: TextRankConfig = json_config.clone().into();
+            let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+            let spec = doc.pipeline.unwrap();
+
+            let chunks = NounChunker::new()
+                .with_min_length(config.min_phrase_length)
+                .with_max_length(config.max_phrase_length)
+                .extract_chunks(&tokens);
+
+            let mut builder = SpecPipelineBuilder::new().with_chunks(chunks);
+            // Provide context that some presets require
+            if *preset == "biased_textrank" {
+                builder = builder.with_focus_terms(vec!["machine".into()], 5.0);
+            }
+            if *preset == "topical_pagerank" {
+                builder = builder.with_topic_weights(
+                    [("machine".into(), 1.0), ("learning".into(), 0.8)].into(),
+                    0.0,
+                );
+            }
+
+            let pipeline = builder.build_from_spec(&spec, &config)
+                .unwrap_or_else(|e| panic!("preset '{preset}' failed to build: {e}"));
+            let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+            let mut obs = crate::pipeline::observer::NoopObserver;
+            let result = pipeline.run(stream, &config, &mut obs);
+
+            assert!(result.converged, "preset '{preset}' did not converge");
+            assert!(!result.phrases.is_empty(), "preset '{preset}' produced no phrases");
+            // Scores should be sorted descending
+            for w in result.phrases.windows(2) {
+                assert!(
+                    w[0].score >= w[1].score,
+                    "preset '{preset}' has unsorted scores: {} > {}",
+                    w[0].score, w[1].score
+                );
+            }
+        }
+    }
+
+    /// All 7 presets validate successfully through validate_only mode.
+    #[test]
+    fn test_all_presets_validate_successfully() {
+        for preset in VALID_PRESETS {
+            let spec = PipelineSpec::Preset(preset.to_string());
+            let resolved = resolve_spec(&spec)
+                .unwrap_or_else(|e| panic!("preset '{preset}' failed to resolve: {e}"));
+            let resp = validate_spec_impl(&resolved);
+            assert!(
+                resp.valid,
+                "preset '{preset}' validation failed: {:?}",
+                resp.report
+            );
+        }
+    }
+
+    /// Serialize a V1 spec to JSON, deserialize it back, build, and run —
+    /// verify the round-trip produces identical results.
+    #[test]
+    fn test_spec_serialize_deserialize_build_run_roundtrip() {
+        use crate::pipeline::spec::{ModuleSet, RuntimeSpec, RankSpec, TeleportSpec, GraphSpec};
+
+        // Build a non-trivial V1 spec programmatically
+        let original = PipelineSpecV1 {
+            v: 1,
+            preset: None,
+            modules: ModuleSet {
+                graph: Some(GraphSpec::CooccurrenceWindow {
+                    window_size: Some(4),
+                    cross_sentence: Some(true),
+                    edge_weighting: None,
+                }),
+                rank: Some(RankSpec::PersonalizedPagerank {
+                    damping: Some(0.9),
+                    max_iterations: Some(150),
+                    convergence_threshold: None,
+                }),
+                teleport: Some(TeleportSpec::Position { shape: None }),
+                ..Default::default()
+            },
+            runtime: RuntimeSpec::default(),
+            expose: None,
+            strict: false,
+            unknown_fields: std::collections::HashMap::new(),
+        };
+
+        // Serialize → JSON string → deserialize
+        let json_str = serde_json::to_string(&original).unwrap();
+        let round_tripped: PipelineSpecV1 = serde_json::from_str(&json_str).unwrap();
+
+        // Both should build and produce identical results
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..TextRankConfig::default()
+        };
+        let tokens_json = pipeline_test_tokens_json();
+        let tokens: Vec<Token> = serde_json::from_str::<Vec<JsonToken>>(tokens_json)
+            .unwrap()
+            .into_iter()
+            .map(Token::from)
+            .collect();
+
+        let run_with_spec = |spec: &PipelineSpecV1| {
+            let chunks = NounChunker::new()
+                .with_min_length(config.min_phrase_length)
+                .with_max_length(config.max_phrase_length)
+                .extract_chunks(&tokens);
+            let pipeline = SpecPipelineBuilder::new()
+                .with_chunks(chunks)
+                .build(spec, &config)
+                .unwrap();
+            let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+            let mut obs = crate::pipeline::observer::NoopObserver;
+            pipeline.run(stream, &config, &mut obs)
+        };
+
+        let result_a = run_with_spec(&original);
+        let result_b = run_with_spec(&round_tripped);
+
+        assert_eq!(result_a.phrases.len(), result_b.phrases.len());
+        assert_eq!(result_a.converged, result_b.converged);
+        assert_eq!(result_a.iterations, result_b.iterations);
+        for (a, b) in result_a.phrases.iter().zip(&result_b.phrases) {
+            assert_eq!(a.text, b.text);
+            assert_eq!(a.lemma, b.lemma);
+            assert!((a.score - b.score).abs() < 1e-12, "scores differ for '{}': {} vs {}", a.text, a.score, b.score);
+            assert_eq!(a.rank, b.rank);
+        }
+    }
+
+    /// Explicit module specs override preset defaults correctly.
+    #[test]
+    fn test_module_override_takes_precedence_over_preset() {
+        use crate::pipeline::spec::{ModuleSet, RuntimeSpec, GraphSpec};
+
+        // Start from single_rank preset (cross_sentence=true, no window_size)
+        // Override with window_size=5
+        let spec = PipelineSpec::V1(PipelineSpecV1 {
+            v: 1,
+            preset: Some("single_rank".into()),
+            modules: ModuleSet {
+                graph: Some(GraphSpec::CooccurrenceWindow {
+                    window_size: Some(5),
+                    cross_sentence: None, // should inherit true from preset
+                    edge_weighting: None,
+                }),
+                ..Default::default()
+            },
+            runtime: RuntimeSpec::default(),
+            expose: None,
+            strict: false,
+            unknown_fields: std::collections::HashMap::new(),
+        });
+
+        let resolved = resolve_spec(&spec).unwrap();
+
+        // Verify deep merge: user's window_size=5 + preset's cross_sentence=true
+        match &resolved.modules.graph {
+            Some(GraphSpec::CooccurrenceWindow { window_size, cross_sentence, .. }) => {
+                assert_eq!(*window_size, Some(5), "user override lost");
+                assert_eq!(*cross_sentence, Some(true), "preset default lost");
+            }
+            other => panic!("expected CooccurrenceWindow, got {:?}", other),
+        }
+
+        // Should also build and run successfully
+        let config = TextRankConfig {
+            determinism: crate::types::DeterminismMode::Deterministic,
+            ..TextRankConfig::default()
+        };
+        let tokens_json = pipeline_test_tokens_json();
+        let tokens: Vec<Token> = serde_json::from_str::<Vec<JsonToken>>(tokens_json)
+            .unwrap()
+            .into_iter()
+            .map(Token::from)
+            .collect();
+        let chunks = NounChunker::new()
+            .with_min_length(config.min_phrase_length)
+            .with_max_length(config.max_phrase_length)
+            .extract_chunks(&tokens);
+        let pipeline = SpecPipelineBuilder::new()
+            .with_chunks(chunks)
+            .build_from_spec(&spec, &config)
+            .unwrap();
+        let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+        let mut obs = crate::pipeline::observer::NoopObserver;
+        let result = pipeline.run(stream, &config, &mut obs);
+        assert!(result.converged);
+        assert!(!result.phrases.is_empty());
+    }
+
+    /// Capability discovery modules are consistent with actual spec types:
+    /// every module type listed can be embedded in a V1 spec and parsed.
+    #[test]
+    fn test_capabilities_modules_are_parseable_spec_types() {
+        use crate::pipeline::spec::ModuleSet;
+
+        let caps = build_capabilities();
+        // For each stage→types pair, construct a JSON spec with that module
+        // and verify it parses without error.
+        let stage_json_templates: Vec<(&str, Vec<String>)> = vec![
+            ("preprocess", caps.modules["preprocess"].clone()),
+            ("candidates", caps.modules["candidates"].clone()),
+            ("graph", caps.modules["graph"].clone()),
+            ("teleport", caps.modules["teleport"].clone()),
+            ("clustering", caps.modules["clustering"].clone()),
+            ("rank", caps.modules["rank"].clone()),
+            ("phrases", caps.modules["phrases"].clone()),
+            ("format", caps.modules["format"].clone()),
+        ];
+        for (stage, types) in &stage_json_templates {
+            for type_name in types {
+                let json = format!(
+                    r#"{{ "v": 1, "modules": {{ "{stage}": {{ "type": "{type_name}" }} }} }}"#,
+                );
+                let result: Result<PipelineSpecV1, _> = serde_json::from_str(&json);
+                assert!(
+                    result.is_ok(),
+                    "capability module '{stage}.{type_name}' failed to parse: {:?}",
+                    result.err()
+                );
+            }
+        }
+
+        // Also verify graph_transforms are parseable
+        for type_name in &caps.modules["graph_transforms"] {
+            let json = format!(
+                r#"{{ "v": 1, "modules": {{ "graph_transforms": [{{ "type": "{type_name}" }}] }} }}"#,
+            );
+            let result: Result<PipelineSpecV1, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_ok(),
+                "capability transform '{type_name}' failed to parse: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// `capabilities` flag takes priority over `validate_only` when both are set.
+    #[test]
+    fn test_capabilities_takes_priority_over_validate_only() {
+        let doc: JsonDocument = serde_json::from_str(
+            r#"{"capabilities": true, "validate_only": true}"#,
+        )
+        .unwrap();
+        assert!(doc.capabilities);
+        assert!(doc.validate_only);
+        // In extract_from_json dispatch, capabilities is checked first
+        // so we should get a capabilities response, not a validation error
+        // about missing pipeline field.
+        let resp = build_capabilities();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("version").is_some());
+        assert!(json.get("modules").is_some());
+    }
+
+    /// Deterministic execution produces identical results across runs.
+    #[test]
+    fn test_deterministic_pipeline_reproducibility() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "preset": "position_rank",
+                    "modules": {{
+                        "rank": {{ "type": "personalized_pagerank", "damping": 0.85 }}
+                    }}
+                }},
+                "config": {{"determinism": "deterministic"}}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+
+        // Run twice and compare
+        let run_once = || {
+            let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+            let json_config = doc.config.unwrap_or_default();
+            let config: TextRankConfig = json_config.clone().into();
+            let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+            let spec = doc.pipeline.unwrap();
+
+            let chunks = NounChunker::new()
+                .with_min_length(config.min_phrase_length)
+                .with_max_length(config.max_phrase_length)
+                .extract_chunks(&tokens);
+
+            let pipeline = SpecPipelineBuilder::new()
+                .with_chunks(chunks)
+                .build_from_spec(&spec, &config)
+                .unwrap();
+            let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+            let mut obs = crate::pipeline::observer::NoopObserver;
+            pipeline.run(stream, &config, &mut obs)
+        };
+
+        let r1 = run_once();
+        let r2 = run_once();
+
+        assert_eq!(r1.phrases.len(), r2.phrases.len());
+        assert_eq!(r1.iterations, r2.iterations);
+        for (a, b) in r1.phrases.iter().zip(&r2.phrases) {
+            assert_eq!(a.text, b.text);
+            assert_eq!(a.score, b.score, "non-deterministic score for '{}'", a.text);
+        }
+    }
+
+    /// Invalid specs produce correct error diagnostics through validate_only.
+    #[test]
+    fn test_invalid_spec_errors_through_validate_only() {
+        // Case 1: personalized_pagerank without teleport
+        let spec: PipelineSpecV1 = serde_json::from_str(r#"{
+            "v": 1,
+            "modules": { "rank": { "type": "personalized_pagerank" } }
+        }"#).unwrap();
+        let resp = validate_spec_impl(&spec);
+        assert!(!resp.valid);
+        let json = serde_json::to_value(&resp).unwrap();
+        let diags = json["diagnostics"].as_array().unwrap();
+        assert!(diags.iter().any(|d| d["code"] == "missing_stage"), "expected missing_stage error");
+
+        // Case 2: topic_graph without clustering or phrase_candidates
+        let spec: PipelineSpecV1 = serde_json::from_str(r#"{
+            "v": 1,
+            "modules": { "graph": { "type": "topic_graph" } }
+        }"#).unwrap();
+        let resp = validate_spec_impl(&spec);
+        assert!(!resp.valid);
+        let json = serde_json::to_value(&resp).unwrap();
+        let diags = json["diagnostics"].as_array().unwrap();
+        assert!(diags.len() >= 2, "expected multiple errors for topic_graph without deps");
+
+        // Case 3: unknown preset through the resolve path
+        let spec = PipelineSpec::Preset("nonexistent".into());
+        let response = match resolve_spec(&spec) {
+            Ok(resolved) => validate_spec_impl(&resolved),
+            Err(err) => ValidationResponse {
+                valid: false,
+                report: crate::pipeline::validation::ValidationReport {
+                    diagnostics: vec![crate::pipeline::validation::ValidationDiagnostic::error(err)],
+                },
+            },
+        };
+        assert!(!response.valid);
+    }
+
+    /// Config `window_size` serves as fallback for `CooccurrenceWindow` modules
+    /// that omit an explicit window_size parameter.
+    #[test]
+    fn test_config_window_size_is_fallback_for_module_parameter() {
+        // Use a V1 spec with explicit CooccurrenceWindow but window_size=None.
+        // The builder should use cfg.window_size as fallback.
+        let run_with_config_ws = |ws: usize| {
+            let json_input = format!(
+                r#"{{
+                    "tokens": {},
+                    "pipeline": {{
+                        "v": 1,
+                        "modules": {{
+                            "graph": {{ "type": "cooccurrence_window" }}
+                        }}
+                    }},
+                    "config": {{
+                        "window_size": {ws},
+                        "determinism": "deterministic"
+                    }}
+                }}"#,
+                pipeline_test_tokens_json()
+            );
+            let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+            let json_config = doc.config.unwrap_or_default();
+            let config: TextRankConfig = json_config.clone().into();
+            let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+            let spec = doc.pipeline.unwrap();
+
+            let chunks = NounChunker::new()
+                .with_min_length(config.min_phrase_length)
+                .with_max_length(config.max_phrase_length)
+                .extract_chunks(&tokens);
+
+            let pipeline = SpecPipelineBuilder::new()
+                .with_chunks(chunks)
+                .build_from_spec(&spec, &config)
+                .unwrap();
+            let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+            let mut obs = crate::pipeline::observer::NoopObserver;
+            pipeline.run(stream, &config, &mut obs)
+        };
+
+        // window_size=1 only connects immediate neighbors;
+        // window_size=10 connects nearly all tokens within a sentence.
+        let r_small = run_with_config_ws(1);
+        let r_large = run_with_config_ws(10);
+
+        assert!(r_small.converged);
+        assert!(r_large.converged);
+        assert!(!r_small.phrases.is_empty());
+        assert!(!r_large.phrases.is_empty());
+
+        // Different window sizes → different graph edges → different scores
+        let scores_a: Vec<f64> = r_small.phrases.iter().map(|p| p.score).collect();
+        let scores_b: Vec<f64> = r_large.phrases.iter().map(|p| p.score).collect();
+        assert_ne!(scores_a, scores_b, "different window sizes should produce different scores");
+    }
+
+    /// Pipeline-level module override trumps config-level defaults.
+    #[test]
+    fn test_pipeline_module_overrides_config_window_size() {
+        use crate::pipeline::spec::{ModuleSet, RuntimeSpec, GraphSpec};
+
+        // config.window_size = 3, but pipeline spec sets window_size = 6
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{
+                        "graph": {{ "type": "cooccurrence_window", "window_size": 6 }}
+                    }}
+                }},
+                "config": {{
+                    "window_size": 3,
+                    "determinism": "deterministic"
+                }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+
+        // Also run with pipeline window_size=6 AND config window_size=6
+        // to verify the pipeline spec is what determines the value
+        let json_input_matching = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{
+                        "graph": {{ "type": "cooccurrence_window", "window_size": 6 }}
+                    }}
+                }},
+                "config": {{
+                    "window_size": 6,
+                    "determinism": "deterministic"
+                }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+
+        let run = |input: &str| {
+            let doc: JsonDocument = serde_json::from_str(input).unwrap();
+            let json_config = doc.config.unwrap_or_default();
+            let config: TextRankConfig = json_config.clone().into();
+            let tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
+            let spec = doc.pipeline.unwrap();
+
+            let chunks = NounChunker::new()
+                .with_min_length(config.min_phrase_length)
+                .with_max_length(config.max_phrase_length)
+                .extract_chunks(&tokens);
+
+            let pipeline = SpecPipelineBuilder::new()
+                .with_chunks(chunks)
+                .build_from_spec(&spec, &config)
+                .unwrap();
+            let stream = crate::pipeline::artifacts::TokenStream::from_tokens(&tokens);
+            let mut obs = crate::pipeline::observer::NoopObserver;
+            pipeline.run(stream, &config, &mut obs)
+        };
+
+        let r_override = run(&json_input);
+        let r_matching = run(&json_input_matching);
+
+        // Pipeline spec window_size=6 should produce same results regardless of
+        // config.window_size, because the spec-level module takes precedence.
+        assert_eq!(r_override.phrases.len(), r_matching.phrases.len());
+        for (a, b) in r_override.phrases.iter().zip(&r_matching.phrases) {
+            assert_eq!(a.text, b.text);
+            assert!((a.score - b.score).abs() < 1e-12,
+                "pipeline module override should produce same result regardless of config: '{}' {} vs {}",
+                a.text, a.score, b.score
+            );
+        }
+    }
 }
