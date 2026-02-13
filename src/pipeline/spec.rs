@@ -584,6 +584,7 @@ impl ClusteringSpec {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RankSpec {
     /// Standard (unpersonalized) PageRank.
+    #[serde(alias = "pagerank")]
     StandardPagerank,
     /// Personalized PageRank with a teleport distribution.
     PersonalizedPagerank {
@@ -704,6 +705,11 @@ pub enum PhraseGroupingSpec {
 pub enum FormatSpec {
     /// Standard JSON output format.
     StandardJson,
+    /// Standard JSON with debug data under a configurable key.
+    StandardJsonWithDebug {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        debug_key: Option<String>,
+    },
     /// Sentence-level JSON output with optional position-based sorting.
     #[cfg(feature = "sentence-rank")]
     SentenceJson {
@@ -716,6 +722,7 @@ impl FormatSpec {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::StandardJson => "standard_json",
+            Self::StandardJsonWithDebug { .. } => "standard_json_with_debug",
             #[cfg(feature = "sentence-rank")]
             Self::SentenceJson { .. } => "sentence_json",
         }
@@ -1497,11 +1504,47 @@ mod tests {
         #[cfg(feature = "sentence-rank")]
         assert_eq!(PhraseSpec::SentencePhrases.type_name(), "sentence_phrases");
         assert_eq!(FormatSpec::StandardJson.type_name(), "standard_json");
+        assert_eq!(
+            FormatSpec::StandardJsonWithDebug { debug_key: None }.type_name(),
+            "standard_json_with_debug"
+        );
         #[cfg(feature = "sentence-rank")]
         assert_eq!(
             FormatSpec::SentenceJson { sort_by_position: None }.type_name(),
             "sentence_json"
         );
+    }
+
+    #[test]
+    fn test_serde_alias_pagerank() {
+        let spec: RankSpec = serde_json::from_str(r#"{"type": "pagerank"}"#).unwrap();
+        assert!(matches!(spec, RankSpec::StandardPagerank));
+    }
+
+    #[test]
+    fn test_standard_json_with_debug_serde() {
+        let spec: FormatSpec = serde_json::from_str(
+            r#"{"type": "standard_json_with_debug", "debug_key": "meta"}"#
+        ).unwrap();
+        match spec {
+            FormatSpec::StandardJsonWithDebug { debug_key } => {
+                assert_eq!(debug_key.as_deref(), Some("meta"));
+            }
+            _ => panic!("expected StandardJsonWithDebug"),
+        }
+    }
+
+    #[test]
+    fn test_standard_json_with_debug_no_key() {
+        let spec: FormatSpec = serde_json::from_str(
+            r#"{"type": "standard_json_with_debug"}"#
+        ).unwrap();
+        match spec {
+            FormatSpec::StandardJsonWithDebug { debug_key } => {
+                assert!(debug_key.is_none());
+            }
+            _ => panic!("expected StandardJsonWithDebug"),
+        }
     }
 
     // ─── resolve_preset ───────────────────────────────────────────────

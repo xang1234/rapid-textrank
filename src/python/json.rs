@@ -5,11 +5,11 @@
 
 use crate::phrase::chunker::NounChunker;
 use crate::phrase::extraction::extract_keyphrases_with_info;
-use crate::pipeline::artifacts::{PipelineWorkspace, TokenStream};
-use crate::pipeline::observer::NoopObserver;
+use crate::pipeline::artifacts::{DebugPayload, FormattedResult, PipelineWorkspace, TokenStream};
+use crate::pipeline::observer::{NoopObserver, StageTimingObserver};
 #[cfg(feature = "sentence-rank")]
 use crate::pipeline::runner::SentenceRankPipeline;
-use crate::pipeline::spec::{resolve_spec, PipelineSpec, PipelineSpecV1, VALID_PRESETS};
+use crate::pipeline::spec::{resolve_spec, FormatSpec, PipelineSpec, PipelineSpecV1, VALID_PRESETS};
 use crate::pipeline::spec_builder::SpecPipelineBuilder;
 use crate::pipeline::validation::{ValidationDiagnostic, ValidationEngine, ValidationReport};
 use crate::types::{DeterminismMode, PhraseGrouping, PosTag, ScoreAggregation, TextRankConfig, Token};
@@ -263,6 +263,9 @@ impl From<JsonConfig> for TextRankConfig {
                 _ => DeterminismMode::Default,
             },
             debug_level: crate::pipeline::artifacts::DebugLevel::None,
+            debug_top_k: crate::pipeline::artifacts::DebugLevel::DEFAULT_TOP_K,
+            max_nodes: None,
+            max_edges: None,
         }
     }
 }
@@ -332,6 +335,8 @@ pub struct JsonResult {
     pub phrases: Vec<JsonPhrase>,
     pub converged: bool,
     pub iterations: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<crate::pipeline::artifacts::DebugPayload>,
 }
 
 /// JSON response for validation-only requests.
@@ -384,7 +389,7 @@ pub fn build_capabilities() -> CapabilitiesResponse {
     phrases.push("sentence_phrases".into());
     modules.insert("phrases".into(), phrases);
 
-    let mut format = vec!["standard_json".into()];
+    let mut format = vec!["standard_json".into(), "standard_json_with_debug".into()];
     #[cfg(feature = "sentence-rank")]
     format.push("sentence_json".into());
     modules.insert("format".into(), format);
@@ -410,6 +415,163 @@ pub fn validate_spec_impl(spec: &PipelineSpecV1) -> ValidationResponse {
     }
 }
 
+/// Attach stage timing data from an observer to a pipeline result.
+fn attach_stage_timings(
+    mut result: FormattedResult,
+    observer: &StageTimingObserver,
+) -> FormattedResult {
+    let timings: Vec<(String, f64)> = observer
+        .reports()
+        .iter()
+        .map(|(name, report)| (name.to_string(), report.duration_ms()))
+        .collect();
+    match result.debug.as_mut() {
+        Some(payload) => payload.stage_timings = Some(timings),
+        None => {
+            result.debug = Some(DebugPayload {
+                stage_timings: Some(timings),
+                ..Default::default()
+            });
+        }
+    }
+    result
+}
+
+/// Serialize a `JsonResult` respecting the `FormatSpec` (e.g., custom debug key).
+fn serialize_result_with_format(result: &JsonResult, format: Option<&FormatSpec>) -> Result<String, String> {
+    match format {
+        Some(FormatSpec::StandardJsonWithDebug { debug_key }) => {
+            let key = debug_key.as_deref().unwrap_or("debug");
+            if key == "debug" {
+                // No renaming needed
+                return serde_json::to_string(result).map_err(|e| e.to_string());
+            }
+            let mut value = serde_json::to_value(result).map_err(|e| e.to_string())?;
+            if let Some(debug) = value.as_object_mut().and_then(|m| m.remove("debug")) {
+                value.as_object_mut().unwrap().insert(key.to_string(), debug);
+            }
+            serde_json::to_string(&value).map_err(|e| e.to_string())
+        }
+        _ => serde_json::to_string(result).map_err(|e| e.to_string()),
+    }
+}
+
+/// Apply resolved spec settings to config and run the pipeline.
+///
+/// This is the shared wiring logic for both `process_single_doc` and
+/// `process_single_doc_with_workspace`. It:
+/// 1. Resolves + validates the spec
+/// 2. Applies `expose` → `debug_level` + `debug_top_k`
+/// 3. Applies `runtime.deterministic`, `max_tokens`, `max_nodes`, `max_edges`
+/// 4. Builds the pipeline via `SpecPipelineBuilder`
+/// 5. Runs with conditional `StageTimingObserver`
+/// 6. Wraps in `runtime.scoped()` for thread control
+/// 7. Serializes with `FormatSpec` awareness
+fn run_pipeline_from_spec(
+    spec: &PipelineSpec,
+    tokens: &[Token],
+    config: &mut TextRankConfig,
+    json_config: &JsonConfig,
+    workspace: Option<&mut PipelineWorkspace>,
+) -> Result<String, String> {
+    // 1. Resolve + validate
+    let resolved = resolve_spec(spec).map_err(|e| e.to_string())?;
+    let report = ValidationEngine::with_defaults().validate(&resolved);
+    if let Some(err) = report.errors().next() {
+        return Err(err.to_string());
+    }
+
+    // 2. Apply expose → debug_level + debug_top_k
+    if let Some(ref expose) = resolved.expose {
+        config.debug_level = expose.to_debug_level();
+        let requested = expose.effective_top_k();
+        let allowed = resolved.runtime.effective_debug_top_k();
+        config.debug_top_k = requested.min(allowed);
+    }
+
+    // 3. Apply runtime controls
+    if resolved.runtime.deterministic == Some(true) {
+        config.determinism = DeterminismMode::Deterministic;
+    }
+
+    // 3a. max_tokens check (before heavy work)
+    if let Some(max) = resolved.runtime.max_tokens {
+        if tokens.len() > max {
+            return Err(format!(
+                "token count {} exceeds runtime limit of {}",
+                tokens.len(),
+                max
+            ));
+        }
+    }
+
+    // 3b. Apply graph limits to config (checked inside runner)
+    if let Some(max) = resolved.runtime.max_nodes {
+        config.max_nodes = Some(max);
+    }
+    if let Some(max) = resolved.runtime.max_edges {
+        config.max_edges = Some(max);
+    }
+
+    // 4. Build pipeline
+    let chunks = NounChunker::new()
+        .with_min_length(config.min_phrase_length)
+        .with_max_length(config.max_phrase_length)
+        .extract_chunks(tokens);
+
+    let builder = SpecPipelineBuilder::new()
+        .with_chunks(chunks)
+        .with_focus_terms(json_config.focus_terms.clone(), json_config.bias_weight)
+        .with_topic_weights(
+            json_config.topic_weights.clone(),
+            json_config.topic_min_weight,
+        );
+
+    let pipeline = builder
+        .build(&resolved, config)
+        .map_err(|e| e.to_string())?;
+
+    let use_timings = resolved
+        .expose
+        .as_ref()
+        .map_or(false, |e| e.stage_timings);
+    let format_spec = resolved.modules.format.as_ref();
+
+    // 5+6. Run pipeline (conditional observer + scoped threading)
+    let stream = TokenStream::from_tokens(tokens);
+    let formatted = resolved.runtime.scoped(|| {
+        if use_timings {
+            let mut timing_obs = StageTimingObserver::new();
+            let result = match workspace {
+                Some(ws) => {
+                    ws.clear();
+                    pipeline.run_with_workspace(stream, config, &mut timing_obs, ws)
+                }
+                None => pipeline.run(stream, config, &mut timing_obs),
+            };
+            attach_stage_timings(result, &timing_obs)
+        } else {
+            let mut obs = NoopObserver;
+            match workspace {
+                Some(ws) => {
+                    ws.clear();
+                    pipeline.run_with_workspace(stream, config, &mut obs, ws)
+                }
+                None => pipeline.run(stream, config, &mut obs),
+            }
+        }
+    });
+
+    // Check for pipeline-level errors (graph limit exceeded)
+    if let Some(ref err) = formatted.error {
+        return Err(err.clone());
+    }
+
+    // 7. Serialize with format awareness
+    let json_result = formatted_to_json_result(formatted);
+    serialize_result_with_format(&json_result, format_spec)
+}
+
 /// Convert an `ExtractionResult` (from legacy variant dispatch) into a `JsonResult`.
 fn extraction_to_json_result(
     result: crate::phrase::extraction::ExtractionResult,
@@ -428,6 +590,7 @@ fn extraction_to_json_result(
             .collect(),
         converged: result.converged,
         iterations: result.iterations,
+        debug: None,
     }
 }
 
@@ -449,6 +612,7 @@ fn formatted_to_json_result(
             .collect(),
         converged: result.converged,
         iterations: result.iterations as usize,
+        debug: result.debug,
     }
 }
 
@@ -484,7 +648,7 @@ fn process_single_doc(doc: JsonDocument) -> Result<String, String> {
 
     // Convert config & tokens
     let json_config = doc.config.unwrap_or_default();
-    let config: TextRankConfig = json_config.clone().into();
+    let mut config: TextRankConfig = json_config.clone().into();
     let mut tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
 
     if !config.stopwords.is_empty() {
@@ -501,28 +665,7 @@ fn process_single_doc(doc: JsonDocument) -> Result<String, String> {
 
     // Pipeline path — takes precedence over `variant`
     if let Some(ref spec) = doc.pipeline {
-        let chunks = NounChunker::new()
-            .with_min_length(config.min_phrase_length)
-            .with_max_length(config.max_phrase_length)
-            .extract_chunks(&tokens);
-
-        let builder = SpecPipelineBuilder::new()
-            .with_chunks(chunks)
-            .with_focus_terms(json_config.focus_terms.clone(), json_config.bias_weight)
-            .with_topic_weights(
-                json_config.topic_weights.clone(),
-                json_config.topic_min_weight,
-            );
-
-        let pipeline = builder
-            .build_from_spec(spec, &config)
-            .map_err(|e| e.to_string())?;
-        let stream = TokenStream::from_tokens(&tokens);
-        let mut obs = NoopObserver;
-        let formatted = pipeline.run(stream, &config, &mut obs);
-
-        let json_result = formatted_to_json_result(formatted);
-        return serde_json::to_string(&json_result).map_err(|e| e.to_string());
+        return run_pipeline_from_spec(spec, &tokens, &mut config, &json_config, None);
     }
 
     // Legacy variant dispatch (fallback when `pipeline` is absent)
@@ -571,7 +714,7 @@ fn process_single_doc_with_workspace(
 
     // Convert config & tokens
     let json_config = doc.config.unwrap_or_default();
-    let config: TextRankConfig = json_config.clone().into();
+    let mut config: TextRankConfig = json_config.clone().into();
     let mut tokens: Vec<Token> = doc.tokens.into_iter().map(Token::from).collect();
 
     if !config.stopwords.is_empty() {
@@ -588,34 +731,7 @@ fn process_single_doc_with_workspace(
 
     // Pipeline path — takes precedence over `variant`
     if let Some(ref spec) = doc.pipeline {
-        let chunks = NounChunker::new()
-            .with_min_length(config.min_phrase_length)
-            .with_max_length(config.max_phrase_length)
-            .extract_chunks(&tokens);
-
-        let builder = SpecPipelineBuilder::new()
-            .with_chunks(chunks)
-            .with_focus_terms(json_config.focus_terms.clone(), json_config.bias_weight)
-            .with_topic_weights(
-                json_config.topic_weights.clone(),
-                json_config.topic_min_weight,
-            );
-
-        let pipeline = builder
-            .build_from_spec(spec, &config)
-            .map_err(|e| e.to_string())?;
-        let stream = TokenStream::from_tokens(&tokens);
-        let mut obs = NoopObserver;
-        let formatted = match workspace {
-            Some(ws) => {
-                ws.clear();
-                pipeline.run_with_workspace(stream, &config, &mut obs, ws)
-            }
-            None => pipeline.run(stream, &config, &mut obs),
-        };
-
-        let json_result = formatted_to_json_result(formatted);
-        return serde_json::to_string(&json_result).map_err(|e| e.to_string());
+        return run_pipeline_from_spec(spec, &tokens, &mut config, &json_config, workspace);
     }
 
     // Legacy variant dispatch (fallback when `pipeline` is absent)
@@ -712,14 +828,14 @@ pub fn validate_pipeline_spec(json_spec: &str) -> PyResult<String> {
     let pipeline_spec: PipelineSpec = serde_json::from_str(json_spec).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("Invalid pipeline spec: {}", e))
     })?;
-    let response = match &pipeline_spec {
-        PipelineSpec::V1(v1) => validate_spec_impl(v1),
-        PipelineSpec::Preset(name) => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Preset pipeline '{}' resolution is not yet implemented",
-                name
-            )));
-        }
+    let response = match resolve_spec(&pipeline_spec) {
+        Ok(resolved) => validate_spec_impl(&resolved),
+        Err(err) => ValidationResponse {
+            valid: false,
+            report: ValidationReport {
+                diagnostics: vec![ValidationDiagnostic::error(err)],
+            },
+        },
     };
     serde_json::to_string(&response)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -781,6 +897,7 @@ pub fn extract_batch_from_json(py: Python<'_>, json_input: &str) -> PyResult<Str
                         .collect(),
                     converged: extraction.converged,
                     iterations: extraction.iterations,
+                    debug: None,
                 }
             })
             .collect()
@@ -2420,5 +2537,399 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("phrases").is_some());
         assert!(parsed.get("converged").is_some());
+    }
+
+    // ─── Patch 1: Preset validation via resolve_spec ─────────────────
+
+    #[test]
+    fn test_validate_preset_string_valid() {
+        // "textrank" is a valid preset — should resolve and validate
+        let spec: PipelineSpec = serde_json::from_str(r#""textrank""#).unwrap();
+        let resolved = resolve_spec(&spec).unwrap();
+        let resp = validate_spec_impl(&resolved);
+        assert!(resp.valid);
+    }
+
+    #[test]
+    fn test_validate_preset_string_invalid() {
+        // "nonexistent" is not a valid preset — resolve should fail
+        let spec: PipelineSpec = serde_json::from_str(r#""nonexistent""#).unwrap();
+        assert!(resolve_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn test_validate_only_with_preset_string() {
+        // Full document validation path with a preset string
+        let json_input = r#"{"validate_only": true, "pipeline": "textrank"}"#;
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["valid"], true);
+    }
+
+    #[test]
+    fn test_validate_only_with_invalid_preset() {
+        let json_input = r#"{"validate_only": true, "pipeline": "bogus_preset"}"#;
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["valid"], false);
+    }
+
+    // ─── Patch 8: Serde aliases ──────────────────────────────────────
+
+    #[test]
+    fn test_serde_alias_pagerank() {
+        // "pagerank" should be accepted as an alias for "standard_pagerank"
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{ "rank": {{ "type": "pagerank" }} }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["phrases"].as_array().unwrap().len() > 0);
+    }
+
+    // ─── Patch 2+3: expose → debug_level + debug_top_k ──────────────
+
+    #[test]
+    fn test_expose_graph_stats_in_output() {
+        // When expose.graph_stats=true, debug payload should appear
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "expose": {{ "graph_stats": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("debug").is_some(), "debug key should be present");
+        let debug = &parsed["debug"];
+        assert!(debug.get("graph_stats").is_some(), "graph_stats should be in debug");
+    }
+
+    #[test]
+    fn test_expose_node_scores_top_k() {
+        // expose.node_scores.top_k=3 should limit node scores
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "expose": {{ "node_scores": {{ "top_k": 3 }} }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let debug = &parsed["debug"];
+        let node_scores = debug["node_scores"].as_array().unwrap();
+        assert!(node_scores.len() <= 3, "node_scores should be capped at top_k=3");
+    }
+
+    #[test]
+    fn test_expose_top_k_clamped_by_runtime() {
+        // expose.node_scores.top_k=100 but runtime.max_debug_top_k=2 → clamped to 2
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "expose": {{ "node_scores": {{ "top_k": 100 }} }},
+                    "runtime": {{ "max_debug_top_k": 2 }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let debug = &parsed["debug"];
+        let node_scores = debug["node_scores"].as_array().unwrap();
+        assert!(node_scores.len() <= 2, "node_scores should be clamped to max_debug_top_k=2");
+    }
+
+    #[test]
+    fn test_no_debug_without_expose() {
+        // Without expose, debug key should be absent (backward compat)
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{ "v": 1, "modules": {{}} }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("debug").is_none(), "debug key should be absent without expose");
+    }
+
+    // ─── Patch 4: stage_timings ──────────────────────────────────────
+
+    #[test]
+    fn test_expose_stage_timings() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "expose": {{ "stage_timings": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let debug = &parsed["debug"];
+        assert!(debug.get("stage_timings").is_some(), "stage_timings should be present");
+        let timings = debug["stage_timings"].as_array().unwrap();
+        assert!(!timings.is_empty(), "should have at least one timing entry");
+    }
+
+    // ─── Patch 5: debug field in JsonResult ──────────────────────────
+
+    #[test]
+    fn test_json_result_debug_skip_serializing_if_none() {
+        // JsonResult with debug=None should not include "debug" key
+        let result = JsonResult {
+            phrases: vec![],
+            converged: true,
+            iterations: 1,
+            debug: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("debug").is_none());
+    }
+
+    #[test]
+    fn test_json_result_debug_serialized_when_some() {
+        use crate::pipeline::artifacts::DebugPayload;
+        let result = JsonResult {
+            phrases: vec![],
+            converged: true,
+            iterations: 1,
+            debug: Some(DebugPayload::default()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("debug").is_some());
+    }
+
+    // ─── Patch 6: StandardJsonWithDebug + debug_key ──────────────────
+
+    #[test]
+    fn test_format_standard_json_with_debug_custom_key() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{
+                        "format": {{ "type": "standard_json_with_debug", "debug_key": "introspection" }}
+                    }},
+                    "expose": {{ "graph_stats": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Debug should be under "introspection", not "debug"
+        assert!(parsed.get("debug").is_none(), "default 'debug' key should be absent");
+        assert!(parsed.get("introspection").is_some(), "custom key 'introspection' should be present");
+    }
+
+    #[test]
+    fn test_format_standard_json_with_debug_default_key() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{
+                        "format": {{ "type": "standard_json_with_debug" }}
+                    }},
+                    "expose": {{ "graph_stats": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("debug").is_some(), "'debug' key should be present with default");
+    }
+
+    // ─── Patch 7: Runtime controls ───────────────────────────────────
+
+    #[test]
+    fn test_runtime_max_tokens_rejects() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "runtime": {{ "max_tokens": 3 }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc);
+        assert!(result.is_err(), "should reject input with more tokens than max_tokens");
+        let err = result.unwrap_err();
+        assert!(err.contains("token count"), "error should mention token count: {}", err);
+        assert!(err.contains("exceeds runtime limit"), "error should mention limit: {}", err);
+    }
+
+    #[test]
+    fn test_runtime_deterministic() {
+        // Two runs with deterministic=true should produce identical output
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "runtime": {{ "deterministic": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc1: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let doc2: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result1 = process_single_doc(doc1).unwrap();
+        let result2 = process_single_doc(doc2).unwrap();
+        assert_eq!(result1, result2, "deterministic runs should produce identical output");
+    }
+
+    #[test]
+    fn test_runtime_max_nodes_rejects() {
+        // max_nodes=1 with multi-node graph should error
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "runtime": {{ "max_nodes": 1 }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc);
+        assert!(result.is_err(), "should reject graph exceeding max_nodes");
+        let err = result.unwrap_err();
+        assert!(err.contains("node count"), "error should mention node count: {}", err);
+    }
+
+    #[test]
+    fn test_runtime_max_edges_rejects() {
+        // max_edges=1 should reject a graph with more than 1 edge
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "runtime": {{ "max_edges": 1 }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc);
+        assert!(result.is_err(), "should reject graph exceeding max_edges");
+        let err = result.unwrap_err();
+        assert!(err.contains("edge count"), "error should mention edge count: {}", err);
+    }
+
+    #[test]
+    fn test_runtime_scoped_threading() {
+        // Verify max_threads=1 doesn't crash (functional test)
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "runtime": {{ "max_threads": 1 }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let result = process_single_doc(doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["phrases"].as_array().unwrap().len() > 0);
+    }
+
+    // ─── Capabilities ────────────────────────────────────────────────
+
+    #[test]
+    fn test_capabilities_includes_standard_json_with_debug() {
+        let caps = build_capabilities();
+        let format_list = caps.modules.get("format").unwrap();
+        assert!(format_list.contains(&"standard_json_with_debug".to_string()),
+            "capabilities should list standard_json_with_debug format");
+    }
+
+    // ─── Workspace path also uses new wiring ─────────────────────────
+
+    #[test]
+    fn test_workspace_path_uses_new_wiring() {
+        // Verify process_single_doc_with_workspace also applies expose
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "pipeline": {{
+                    "v": 1,
+                    "modules": {{}},
+                    "expose": {{ "graph_stats": true }}
+                }},
+                "config": {{ "determinism": "deterministic" }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let doc: JsonDocument = serde_json::from_str(&json_input).unwrap();
+        let mut ws = crate::pipeline::artifacts::PipelineWorkspace::new();
+        let result = process_single_doc_with_workspace(doc, Some(&mut ws)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("debug").is_some(), "workspace path should also produce debug output");
     }
 }

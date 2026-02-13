@@ -549,6 +549,19 @@ pub struct TextRankConfig {
     /// Debug output level (default: none — zero overhead).
     #[serde(default)]
     pub debug_level: crate::pipeline::artifacts::DebugLevel,
+    /// Maximum node scores to include in debug output (default: 50).
+    #[serde(default = "default_debug_top_k")]
+    pub debug_top_k: usize,
+    /// Maximum graph nodes before rejecting (pipeline runtime limit).
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+    /// Maximum graph edges before rejecting (pipeline runtime limit).
+    #[serde(default)]
+    pub max_edges: Option<usize>,
+}
+
+fn default_debug_top_k() -> usize {
+    crate::pipeline::artifacts::DebugLevel::DEFAULT_TOP_K
 }
 
 impl Default for TextRankConfig {
@@ -575,6 +588,9 @@ impl Default for TextRankConfig {
             phrase_grouping: PhraseGrouping::ScrubbedText,
             determinism: DeterminismMode::Default,
             debug_level: crate::pipeline::artifacts::DebugLevel::None,
+            debug_top_k: default_debug_top_k(),
+            max_nodes: None,
+            max_edges: None,
         }
     }
 }
@@ -674,6 +690,24 @@ impl TextRankConfig {
     /// Builder method: set debug output level
     pub fn with_debug_level(mut self, level: crate::pipeline::artifacts::DebugLevel) -> Self {
         self.debug_level = level;
+        self
+    }
+
+    /// Builder method: set debug top-K limit
+    pub fn with_debug_top_k(mut self, top_k: usize) -> Self {
+        self.debug_top_k = top_k;
+        self
+    }
+
+    /// Builder method: set maximum graph nodes limit
+    pub fn with_max_nodes(mut self, max: usize) -> Self {
+        self.max_nodes = Some(max);
+        self
+    }
+
+    /// Builder method: set maximum graph edges limit
+    pub fn with_max_edges(mut self, max: usize) -> Self {
+        self.max_edges = Some(max);
         self
     }
 }

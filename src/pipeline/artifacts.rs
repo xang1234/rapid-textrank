@@ -1560,6 +1560,9 @@ pub struct FormattedResult {
     pub iterations: u32,
     /// Optional debug payload (opt-in via `expose` config).
     pub debug: Option<DebugPayload>,
+    /// Optional error message (e.g., graph limit exceeded).
+    /// When set, `phrases` is empty and the caller should surface the error.
+    pub error: Option<String>,
 }
 
 // ============================================================================
@@ -1801,6 +1804,7 @@ impl FormattedResult {
             converged: er.converged,
             iterations: er.iterations as u32,
             debug: None,
+            error: None,
         }
     }
 
@@ -1815,6 +1819,7 @@ impl FormattedResult {
             converged,
             iterations,
             debug: None,
+            error: None,
         }
     }
 

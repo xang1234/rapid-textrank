@@ -623,12 +623,46 @@ where
         observer.on_stage_end(STAGE_PHRASES, &report);
         observer.on_phrases(&phrases);
 
+        // Check graph size limits (pipeline runtime safety bounds).
+        if let Some(max) = cfg.max_nodes {
+            if graph.num_nodes() > max {
+                // Return an empty result with an error signal rather than panicking.
+                // Callers in the JSON layer will convert this to an error string.
+                return FormattedResult {
+                    phrases: Vec::new(),
+                    converged: false,
+                    iterations: 0,
+                    debug: None,
+                    error: Some(format!(
+                        "graph node count {} exceeds runtime limit of {}",
+                        graph.num_nodes(),
+                        max
+                    )),
+                };
+            }
+        }
+        if let Some(max) = cfg.max_edges {
+            if graph.num_edges() > max {
+                return FormattedResult {
+                    phrases: Vec::new(),
+                    converged: false,
+                    iterations: 0,
+                    debug: None,
+                    error: Some(format!(
+                        "graph edge count {} exceeds runtime limit of {}",
+                        graph.num_edges(),
+                        max
+                    )),
+                };
+            }
+        }
+
         // Build debug payload (opt-in via cfg.debug_level).
         let debug_payload = super::DebugPayload::build(
             cfg.debug_level,
             &graph,
             &rank_output,
-            DebugLevel::DEFAULT_TOP_K,
+            cfg.debug_top_k,
         );
 
         // Stage 5: Format result

@@ -242,6 +242,9 @@ impl PyTextRankConfig {
             phrase_grouping: phrase_grouping.parse().unwrap_or(PhraseGrouping::Lemma),
             determinism: det_mode,
             debug_level: crate::pipeline::artifacts::DebugLevel::None,
+            debug_top_k: crate::pipeline::artifacts::DebugLevel::DEFAULT_TOP_K,
+            max_nodes: None,
+            max_edges: None,
         };
 
         config

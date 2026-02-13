@@ -56,14 +56,14 @@ use crate::types::{ChunkSpan, TextRankConfig};
 ///
 /// Construct via [`SpecPipelineBuilder::build`].
 pub type DynPipeline = Pipeline<
-    Box<dyn Preprocessor>,
-    Box<dyn CandidateSelector>,
-    Box<dyn GraphBuilder>,
-    Box<dyn GraphTransform>,
-    Box<dyn TeleportBuilder>,
-    Box<dyn Ranker>,
-    Box<dyn PhraseBuilder>,
-    Box<dyn ResultFormatter>,
+    Box<dyn Preprocessor + Send + Sync>,
+    Box<dyn CandidateSelector + Send + Sync>,
+    Box<dyn GraphBuilder + Send + Sync>,
+    Box<dyn GraphTransform + Send + Sync>,
+    Box<dyn TeleportBuilder + Send + Sync>,
+    Box<dyn Ranker + Send + Sync>,
+    Box<dyn PhraseBuilder + Send + Sync>,
+    Box<dyn ResultFormatter + Send + Sync>,
 >;
 
 // ─── ChainedGraphTransform (private) ───────────────────────────────────────
@@ -72,7 +72,7 @@ pub type DynPipeline = Pipeline<
 ///
 /// Used when the spec's `graph_transforms` array has more than one entry.
 struct ChainedGraphTransform {
-    transforms: Vec<Box<dyn GraphTransform>>,
+    transforms: Vec<Box<dyn GraphTransform + Send + Sync>>,
 }
 
 impl GraphTransform for ChainedGraphTransform {
@@ -155,10 +155,10 @@ impl SpecPipelineBuilder {
         let modules = &spec.modules;
 
         // ── Preprocessor ──────────────────────────────────────────────
-        let preprocessor: Box<dyn Preprocessor> = Box::new(NoopPreprocessor);
+        let preprocessor: Box<dyn Preprocessor + Send + Sync> = Box::new(NoopPreprocessor);
 
         // ── Candidates ────────────────────────────────────────────────
-        let selector: Box<dyn CandidateSelector> = match &modules.candidates {
+        let selector: Box<dyn CandidateSelector + Send + Sync> = match &modules.candidates {
             None | Some(CandidatesSpec::WordNodes) => Box::new(WordNodeSelector),
             Some(CandidatesSpec::PhraseCandidates) => {
                 if self.chunks.is_empty() {
@@ -188,7 +188,7 @@ impl SpecPipelineBuilder {
             }
         });
 
-        let make_clusterer = |spec: &ClusteringSpec| -> Box<dyn Clusterer> {
+        let make_clusterer = |spec: &ClusteringSpec| -> Box<dyn Clusterer + Send + Sync> {
             match spec {
                 ClusteringSpec::Hac { threshold } => {
                     Box::new(JaccardHacClusterer::new(threshold.unwrap_or(0.25)))
@@ -197,7 +197,7 @@ impl SpecPipelineBuilder {
         };
 
         // ── Graph ─────────────────────────────────────────────────────
-        let graph_builder: Box<dyn GraphBuilder> = match &modules.graph {
+        let graph_builder: Box<dyn GraphBuilder + Send + Sync> = match &modules.graph {
             None => {
                 // Default: sentence-bounded, count-accumulating (base_textrank).
                 Box::new(WindowGraphBuilder::base_textrank())
@@ -241,12 +241,12 @@ impl SpecPipelineBuilder {
         };
 
         // ── Graph Transforms ──────────────────────────────────────────
-        let graph_transform: Box<dyn GraphTransform> = if modules.graph_transforms.is_empty() {
+        let graph_transform: Box<dyn GraphTransform + Send + Sync> = if modules.graph_transforms.is_empty() {
             Box::new(NoopGraphTransform)
         } else if modules.graph_transforms.len() == 1 {
             self.make_graph_transform(&modules.graph_transforms[0])
         } else {
-            let transforms: Vec<Box<dyn GraphTransform>> = modules
+            let transforms: Vec<Box<dyn GraphTransform + Send + Sync>> = modules
                 .graph_transforms
                 .iter()
                 .map(|spec| self.make_graph_transform(spec))
@@ -255,7 +255,7 @@ impl SpecPipelineBuilder {
         };
 
         // ── Teleport ──────────────────────────────────────────────────
-        let teleport_builder: Box<dyn TeleportBuilder> = match &modules.teleport {
+        let teleport_builder: Box<dyn TeleportBuilder + Send + Sync> = match &modules.teleport {
             None | Some(TeleportSpec::Uniform) => Box::new(UniformTeleportBuilder),
             Some(TeleportSpec::Position { .. }) => Box::new(PositionTeleportBuilder),
             Some(TeleportSpec::FocusTerms) => {
@@ -289,10 +289,10 @@ impl SpecPipelineBuilder {
         };
 
         // ── Ranker ────────────────────────────────────────────────────
-        let ranker: Box<dyn Ranker> = Box::new(PageRankRanker);
+        let ranker: Box<dyn Ranker + Send + Sync> = Box::new(PageRankRanker);
 
         // ── Phrases ───────────────────────────────────────────────────
-        let phrase_builder: Box<dyn PhraseBuilder> = match &modules.phrases {
+        let phrase_builder: Box<dyn PhraseBuilder + Send + Sync> = match &modules.phrases {
             Some(crate::pipeline::spec::PhraseSpec::ChunkPhrases { .. }) => {
                 Box::new(ChunkPhraseBuilder)
             }
@@ -313,12 +313,17 @@ impl SpecPipelineBuilder {
         };
 
         // ── Format ────────────────────────────────────────────────────
-        let formatter: Box<dyn ResultFormatter> = match &modules.format {
+        let formatter: Box<dyn ResultFormatter + Send + Sync> = match &modules.format {
             #[cfg(feature = "sentence-rank")]
             Some(crate::pipeline::spec::FormatSpec::SentenceJson { sort_by_position }) => {
                 Box::new(SentenceFormatter {
                     sort_by_position: sort_by_position.unwrap_or(false),
                 })
+            }
+            // StandardJsonWithDebug uses the same formatter; the debug_key
+            // renaming is handled at serialization time in json.rs.
+            Some(crate::pipeline::spec::FormatSpec::StandardJsonWithDebug { .. }) => {
+                Box::new(StandardResultFormatter)
             }
             _ => Box::new(StandardResultFormatter),
         };
@@ -375,7 +380,7 @@ impl SpecPipelineBuilder {
     }
 
     /// Map a single `GraphTransformSpec` to a boxed impl.
-    fn make_graph_transform(&self, spec: &GraphTransformSpec) -> Box<dyn GraphTransform> {
+    fn make_graph_transform(&self, spec: &GraphTransformSpec) -> Box<dyn GraphTransform + Send + Sync> {
         match spec {
             GraphTransformSpec::RemoveIntraClusterEdges => {
                 // IntraTopicEdgeRemover needs assignments at runtime, but

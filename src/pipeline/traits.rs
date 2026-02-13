@@ -2682,6 +2682,105 @@ impl ResultFormatter for Box<dyn ResultFormatter> {
     }
 }
 
+// ── Send + Sync boxed-trait impls ──────────────────────────────────────────
+//
+// DynPipeline uses `Box<dyn Trait + Send + Sync>` so its pipelines can be
+// shared across threads (needed by RuntimeSpec::scoped() which wraps execution
+// in a Rayon thread pool).  Rust treats `Box<dyn Trait + Send + Sync>` as a
+// distinct type from `Box<dyn Trait>`, so each stage needs a second impl.
+
+impl Preprocessor for Box<dyn Preprocessor + Send + Sync> {
+    fn preprocess(&self, tokens: &mut TokenStream, cfg: &TextRankConfig) {
+        (**self).preprocess(tokens, cfg)
+    }
+}
+
+impl CandidateSelector for Box<dyn CandidateSelector + Send + Sync> {
+    fn select(&self, tokens: TokenStreamRef<'_>, cfg: &TextRankConfig) -> CandidateSet {
+        (**self).select(tokens, cfg)
+    }
+}
+
+impl GraphBuilder for Box<dyn GraphBuilder + Send + Sync> {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        cfg: &TextRankConfig,
+    ) -> Graph {
+        (**self).build(tokens, candidates, cfg)
+    }
+}
+
+impl GraphTransform for Box<dyn GraphTransform + Send + Sync> {
+    fn transform(
+        &self,
+        graph: &mut Graph,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        cfg: &TextRankConfig,
+    ) {
+        (**self).transform(graph, tokens, candidates, cfg)
+    }
+}
+
+impl Clusterer for Box<dyn Clusterer + Send + Sync> {
+    fn cluster(
+        &self,
+        candidates: CandidateSetRef<'_>,
+        cfg: &TextRankConfig,
+    ) -> ClusterAssignments {
+        (**self).cluster(candidates, cfg)
+    }
+}
+
+impl TeleportBuilder for Box<dyn TeleportBuilder + Send + Sync> {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        cfg: &TextRankConfig,
+    ) -> Option<TeleportVector> {
+        (**self).build(tokens, candidates, cfg)
+    }
+}
+
+impl Ranker for Box<dyn Ranker + Send + Sync> {
+    fn rank(
+        &self,
+        graph: &Graph,
+        teleport: Option<&TeleportVector>,
+        cfg: &TextRankConfig,
+    ) -> RankOutput {
+        (**self).rank(graph, teleport, cfg)
+    }
+}
+
+impl PhraseBuilder for Box<dyn PhraseBuilder + Send + Sync> {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        ranks: &RankOutput,
+        graph: &Graph,
+        cfg: &TextRankConfig,
+    ) -> PhraseSet {
+        (**self).build(tokens, candidates, ranks, graph, cfg)
+    }
+}
+
+impl ResultFormatter for Box<dyn ResultFormatter + Send + Sync> {
+    fn format(
+        &self,
+        phrases: &PhraseSet,
+        ranks: &RankOutput,
+        debug: Option<DebugPayload>,
+        cfg: &TextRankConfig,
+    ) -> FormattedResult {
+        (**self).format(phrases, ranks, debug, cfg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
