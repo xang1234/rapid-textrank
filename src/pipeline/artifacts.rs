@@ -413,7 +413,35 @@ impl PhraseCandidate {
     }
 }
 
-/// Distinguishes the two candidate families.
+/// A single sentence-level candidate (SentenceRank family).
+///
+/// Each sentence in the document becomes a candidate node for sentence-level
+/// TextRank (extractive summarization).
+#[derive(Debug, Clone)]
+pub struct SentenceCandidate {
+    /// 0-based sentence index in the parent token stream.
+    pub sentence_idx: u32,
+    /// Start token index (inclusive).
+    pub start_token: u32,
+    /// End token index (exclusive).
+    pub end_token: u32,
+    /// Character byte-offset of the first byte.
+    pub start_char: u32,
+    /// Character byte-offset one past the last byte.
+    pub end_char: u32,
+    /// Non-stopword lemma IDs within this sentence, preserving duplicates for TF.
+    pub lemma_ids: Vec<u32>,
+}
+
+impl SentenceCandidate {
+    /// Token span length.
+    #[inline]
+    pub fn token_len(&self) -> u32 {
+        self.end_token - self.start_token
+    }
+}
+
+/// Distinguishes the three candidate families.
 ///
 /// Downstream stages (GraphBuilder, TeleportBuilder, etc.) can match on this
 /// to select the appropriate processing strategy.
@@ -423,6 +451,8 @@ pub enum CandidateKind {
     Words(Vec<WordCandidate>),
     /// Phrase-level candidates (one per noun chunk).
     Phrases(Vec<PhraseCandidate>),
+    /// Sentence-level candidates (one per sentence, for extractive summarization).
+    Sentences(Vec<SentenceCandidate>),
 }
 
 /// Set of candidate nodes (word-level or phrase-level) selected for graph
@@ -561,6 +591,7 @@ impl CandidateSet {
         match &self.kind {
             CandidateKind::Words(w) => w.len(),
             CandidateKind::Phrases(p) => p.len(),
+            CandidateKind::Sentences(s) => s.len(),
         }
     }
 
@@ -576,21 +607,72 @@ impl CandidateSet {
         CandidateSetRef { kind: &self.kind }
     }
 
-    /// Access word candidates (panics if phrase-level).
+    /// Access word candidates (panics on wrong variant).
     #[inline]
     pub fn words(&self) -> &[WordCandidate] {
         match &self.kind {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => panic!("called words() on phrase-level CandidateSet"),
+            _ => panic!("called words() on non-word CandidateSet"),
         }
     }
 
-    /// Access phrase candidates (panics if word-level).
+    /// Access phrase candidates (panics on wrong variant).
     #[inline]
     pub fn phrases(&self) -> &[PhraseCandidate] {
         match &self.kind {
             CandidateKind::Phrases(p) => p,
-            CandidateKind::Words(_) => panic!("called phrases() on word-level CandidateSet"),
+            _ => panic!("called phrases() on non-phrase CandidateSet"),
+        }
+    }
+
+    /// Access sentence candidates (panics on wrong variant).
+    #[inline]
+    pub fn sentences(&self) -> &[SentenceCandidate] {
+        match &self.kind {
+            CandidateKind::Sentences(s) => s,
+            _ => panic!("called sentences() on non-sentence CandidateSet"),
+        }
+    }
+
+    /// Build a sentence-level candidate set from a token stream's sentence boundaries.
+    ///
+    /// Each sentence becomes a [`SentenceCandidate`] whose `lemma_ids` are the
+    /// non-stopword lemma IDs within the sentence (preserving duplicates for TF).
+    pub fn from_sentence_boundaries(stream: &TokenStream) -> Self {
+        let num_sentences = stream.num_sentences();
+        let mut sentences = Vec::with_capacity(num_sentences);
+
+        for idx in 0..num_sentences {
+            let range = match stream.sentence_token_range(idx) {
+                Some(r) => r,
+                None => continue,
+            };
+            let tokens_slice = &stream.tokens()[range.clone()];
+            if tokens_slice.is_empty() {
+                continue;
+            }
+
+            let start_char = tokens_slice.first().map_or(0, |t| t.start);
+            let end_char = tokens_slice.last().map_or(0, |t| t.end);
+
+            let lemma_ids: Vec<u32> = tokens_slice
+                .iter()
+                .filter(|t| !t.is_stopword)
+                .map(|t| t.lemma_id)
+                .collect();
+
+            sentences.push(SentenceCandidate {
+                sentence_idx: idx as u32,
+                start_token: range.start as u32,
+                end_token: range.end as u32,
+                start_char,
+                end_char,
+                lemma_ids,
+            });
+        }
+
+        Self {
+            kind: CandidateKind::Sentences(sentences),
         }
     }
 }
@@ -616,6 +698,7 @@ impl<'a> CandidateSetRef<'a> {
         match self.kind {
             CandidateKind::Words(w) => w.len(),
             CandidateKind::Phrases(p) => p.len(),
+            CandidateKind::Sentences(s) => s.len(),
         }
     }
 
@@ -630,7 +713,7 @@ impl<'a> CandidateSetRef<'a> {
     pub fn words(&self) -> &'a [WordCandidate] {
         match self.kind {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => panic!("called words() on phrase-level CandidateSetRef"),
+            _ => panic!("called words() on non-word CandidateSetRef"),
         }
     }
 
@@ -639,7 +722,16 @@ impl<'a> CandidateSetRef<'a> {
     pub fn phrases(&self) -> &'a [PhraseCandidate] {
         match self.kind {
             CandidateKind::Phrases(p) => p,
-            CandidateKind::Words(_) => panic!("called phrases() on word-level CandidateSetRef"),
+            _ => panic!("called phrases() on non-phrase CandidateSetRef"),
+        }
+    }
+
+    /// Access sentence candidates.
+    #[inline]
+    pub fn sentences(&self) -> &'a [SentenceCandidate] {
+        match self.kind {
+            CandidateKind::Sentences(s) => s,
+            _ => panic!("called sentences() on non-sentence CandidateSetRef"),
         }
     }
 }
@@ -2225,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "called phrases() on word-level")]
+    #[should_panic(expected = "called phrases() on non-phrase")]
     fn test_words_panics_on_phrases_access() {
         let tokens = sample_tokens();
         let stream = TokenStream::from_tokens(&tokens);
@@ -2234,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "called words() on phrase-level")]
+    #[should_panic(expected = "called words() on non-word")]
     fn test_phrases_panics_on_words_access() {
         let stream = TokenStream::from_tokens(&[
             Token::new("a", "a", PosTag::Noun, 0, 1, 0, 0),
@@ -3204,5 +3296,79 @@ mod tests {
             // full from level 3+
             assert_eq!(level.includes_full(), i >= 3);
         }
+    }
+
+    // ─── SentenceCandidate tests ──────────────────────────────────────
+
+    #[test]
+    fn test_sentence_candidates_basic() {
+        use crate::types::{PosTag, Token};
+
+        let mut tokens = vec![
+            // Sentence 0: "Machine learning rocks"
+            Token::new("Machine", "machine", PosTag::Noun, 0, 7, 0, 0),
+            Token::new("learning", "learning", PosTag::Noun, 8, 16, 0, 1),
+            Token::new("rocks", "rock", PosTag::Verb, 17, 22, 0, 2),
+            // Sentence 1: "Deep networks improve"
+            Token::new("Deep", "deep", PosTag::Adjective, 24, 28, 1, 3),
+            Token::new("networks", "network", PosTag::Noun, 29, 37, 1, 4),
+            Token::new("improve", "improve", PosTag::Verb, 38, 45, 1, 5),
+        ];
+        // Mark none as stopwords — all lemmas should appear.
+        let stream = TokenStream::from_tokens(&tokens);
+
+        let cs = CandidateSet::from_sentence_boundaries(&stream);
+        assert!(matches!(cs.kind(), CandidateKind::Sentences(_)));
+        assert_eq!(cs.len(), 2);
+
+        let sents = cs.sentences();
+
+        // Sentence 0
+        assert_eq!(sents[0].sentence_idx, 0);
+        assert_eq!(sents[0].start_token, 0);
+        assert_eq!(sents[0].end_token, 3);
+        assert_eq!(sents[0].start_char, 0);
+        assert_eq!(sents[0].end_char, 22);
+        assert_eq!(sents[0].lemma_ids.len(), 3); // machine, learning, rock
+
+        // Sentence 1
+        assert_eq!(sents[1].sentence_idx, 1);
+        assert_eq!(sents[1].start_token, 3);
+        assert_eq!(sents[1].end_token, 6);
+        assert_eq!(sents[1].start_char, 24);
+        assert_eq!(sents[1].end_char, 45);
+        assert_eq!(sents[1].lemma_ids.len(), 3); // deep, network, improve
+
+        // token_len helper
+        assert_eq!(sents[0].token_len(), 3);
+        assert_eq!(sents[1].token_len(), 3);
+
+        // Stopword filtering: mark "rocks" as stopword, rebuild
+        tokens[2].is_stopword = true;
+        let stream2 = TokenStream::from_tokens(&tokens);
+        let cs2 = CandidateSet::from_sentence_boundaries(&stream2);
+        let sents2 = cs2.sentences();
+        assert_eq!(sents2[0].lemma_ids.len(), 2); // machine, learning (rock filtered)
+    }
+
+    #[test]
+    fn test_sentence_candidates_empty() {
+        let stream = TokenStream::from_tokens(&[]);
+        let cs = CandidateSet::from_sentence_boundaries(&stream);
+        assert_eq!(cs.len(), 0);
+        assert!(cs.is_empty());
+        assert!(cs.sentences().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "called words() on non-word CandidateSet")]
+    fn test_sentence_candidates_accessor_panics() {
+        use crate::types::{PosTag, Token};
+        let tokens = vec![
+            Token::new("Hello", "hello", PosTag::Noun, 0, 5, 0, 0),
+        ];
+        let stream = TokenStream::from_tokens(&tokens);
+        let cs = CandidateSet::from_sentence_boundaries(&stream);
+        let _ = cs.words(); // should panic
     }
 }

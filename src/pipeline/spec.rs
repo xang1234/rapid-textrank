@@ -372,6 +372,8 @@ pub enum CandidatesSpec {
     WordNodes,
     /// Noun-phrase chunks as candidates (TopicRank/MultipartiteRank family).
     PhraseCandidates,
+    /// Whole sentences as candidates (SentenceRank / extractive summarization).
+    SentenceCandidates,
 }
 
 impl CandidatesSpec {
@@ -379,6 +381,7 @@ impl CandidatesSpec {
         match self {
             Self::WordNodes => "word_nodes",
             Self::PhraseCandidates => "phrase_candidates",
+            Self::SentenceCandidates => "sentence_candidates",
         }
     }
 }
@@ -1390,6 +1393,7 @@ mod tests {
         assert_eq!(PreprocessSpec::Default.type_name(), "default");
         assert_eq!(CandidatesSpec::WordNodes.type_name(), "word_nodes");
         assert_eq!(CandidatesSpec::PhraseCandidates.type_name(), "phrase_candidates");
+        assert_eq!(CandidatesSpec::SentenceCandidates.type_name(), "sentence_candidates");
         assert_eq!(GraphSpec::TopicGraph.type_name(), "topic_graph");
         assert_eq!(GraphSpec::CandidateGraph.type_name(), "candidate_graph");
         assert_eq!(

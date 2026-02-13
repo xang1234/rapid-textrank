@@ -32,8 +32,8 @@ use crate::pipeline::traits::{
     EdgeWeightPolicy, FocusTermsTeleportBuilder, GraphBuilder, GraphTransform,
     JaccardHacClusterer, MultipartitePhraseBuilder, MultipartiteTransform, NoopGraphTransform,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
-    PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, StandardResultFormatter,
-    TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
+    PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, SentenceCandidateSelector,
+    StandardResultFormatter, TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
     TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
     WordNodeSelector,
 };
@@ -166,6 +166,9 @@ impl SpecPipelineBuilder {
                     .with_hint("Supply chunks via SpecPipelineBuilder::with_chunks()"));
                 }
                 Box::new(PhraseCandidateSelector::new(self.chunks.clone()))
+            }
+            Some(CandidatesSpec::SentenceCandidates) => {
+                Box::new(SentenceCandidateSelector)
             }
         };
 

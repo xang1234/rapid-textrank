@@ -24,8 +24,8 @@ pub mod validation;
 pub use artifacts::{
     CandidateKind, CandidateSet, CandidateSetRef, ClusterAssignments, ConvergenceSummary,
     DebugLevel, DebugPayload, FormattedResult, Graph, GraphStats, PhraseCandidate, PhraseEntry,
-    PhraseSet, PhraseSetRef, PipelineWorkspace, RankDiagnostics, RankOutput, TeleportType,
-    TeleportVector, TokenEntry, TokenStream, TokenStreamRef, WordCandidate,
+    PhraseSet, PhraseSetRef, PipelineWorkspace, RankDiagnostics, RankOutput, SentenceCandidate,
+    TeleportType, TeleportVector, TokenEntry, TokenStream, TokenStreamRef, WordCandidate,
 };
 
 // Re-export observer types.
@@ -55,8 +55,8 @@ pub use traits::{
     GraphTransform, IntraTopicEdgeRemover, JaccardHacClusterer, Linkage,
     MultipartitePhraseBuilder, MultipartiteTransform, NoopClusterer, NoopGraphTransform,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
-    PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, StandardResultFormatter,
-    TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
+    PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, SentenceCandidateSelector,
+    StandardResultFormatter, TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
     TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
     WordNodeSelector, DEFAULT_WINDOW_SIZE,
 };

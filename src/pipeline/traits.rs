@@ -202,6 +202,53 @@ impl CandidateSelector for PhraseCandidateSelector {
     }
 }
 
+/// Sentence-level candidate selector for extractive summarization.
+///
+/// Each sentence in the token stream becomes a candidate node. Non-stopword
+/// lemma IDs are collected per sentence (preserving duplicates for TF).
+///
+/// This is the selector used by SentenceRank.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SentenceCandidateSelector;
+
+impl CandidateSelector for SentenceCandidateSelector {
+    fn select(&self, tokens: TokenStreamRef<'_>, _cfg: &TextRankConfig) -> CandidateSet {
+        let num_sentences = tokens.num_sentences();
+        let mut sentences = Vec::with_capacity(num_sentences);
+
+        for idx in 0..num_sentences {
+            let range = match tokens.sentence_token_range(idx) {
+                Some(r) => r,
+                None => continue,
+            };
+            let tokens_slice = &tokens.tokens()[range.clone()];
+            if tokens_slice.is_empty() {
+                continue;
+            }
+
+            let start_char = tokens_slice.first().map_or(0, |t| t.start);
+            let end_char = tokens_slice.last().map_or(0, |t| t.end);
+
+            let lemma_ids: Vec<u32> = tokens_slice
+                .iter()
+                .filter(|t| !t.is_stopword)
+                .map(|t| t.lemma_id)
+                .collect();
+
+            sentences.push(crate::pipeline::artifacts::SentenceCandidate {
+                sentence_idx: idx as u32,
+                start_token: range.start as u32,
+                end_token: range.end as u32,
+                start_char,
+                end_char,
+                lemma_ids,
+            });
+        }
+
+        CandidateSet::from_kind(CandidateKind::Sentences(sentences))
+    }
+}
+
 // ============================================================================
 // GraphBuilder — candidates + tokens to co-occurrence graph (stage 2)
 // ============================================================================
@@ -437,12 +484,10 @@ impl GraphBuilder for WindowGraphBuilder {
         cfg: &TextRankConfig,
     ) -> Graph {
         // Only word-level candidates produce co-occurrence graphs.
-        // Phrase-level candidates use topic-graph construction (TopicRank).
+        // Other candidate families use their own graph construction.
         let words = match candidates.kind() {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => {
-                // Return an empty graph — phrase-family graph construction
-                // is a different stage (future TopicRank GraphBuilder).
+            _ => {
                 let empty = crate::graph::builder::GraphBuilder::new();
                 return Graph::from_builder(&empty);
             }
@@ -1259,7 +1304,7 @@ impl TeleportBuilder for PositionTeleportBuilder {
     ) -> Option<TeleportVector> {
         let words = match candidates.kind() {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => return None,
+            _ => return None,
         };
         if words.is_empty() {
             return None;
@@ -1318,7 +1363,7 @@ impl TeleportBuilder for FocusTermsTeleportBuilder {
     ) -> Option<TeleportVector> {
         let words = match candidates.kind() {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => return None,
+            _ => return None,
         };
         if words.is_empty() {
             return None;
@@ -1383,7 +1428,7 @@ impl TeleportBuilder for TopicWeightsTeleportBuilder {
     ) -> Option<TeleportVector> {
         let words = match candidates.kind() {
             CandidateKind::Words(w) => w,
-            CandidateKind::Phrases(_) => return None,
+            _ => return None,
         };
         if words.is_empty() {
             return None;
@@ -4739,7 +4784,7 @@ mod tests {
             ) -> Option<TeleportVector> {
                 let words = match candidates.kind() {
                     CandidateKind::Words(w) => w,
-                    CandidateKind::Phrases(_) => return None,
+                    _ => return None,
                 };
                 if words.is_empty() {
                     return None;
@@ -4789,7 +4834,7 @@ mod tests {
             ) -> Option<TeleportVector> {
                 let words = match candidates.kind() {
                     CandidateKind::Words(w) => w,
-                    CandidateKind::Phrases(_) => return None,
+                    _ => return None,
                 };
                 if words.is_empty() {
                     return None;
@@ -7408,5 +7453,34 @@ mod tests {
         );
 
         assert!(phrases.len() <= 1, "top_n=1 should produce at most 1 phrase");
+    }
+
+    // ─── SentenceCandidateSelector tests ────────────────────────────────
+
+    #[test]
+    fn test_sentence_candidate_selector() {
+        let tokens = rich_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default();
+
+        let selector = SentenceCandidateSelector;
+        let cs = selector.select(stream.as_ref(), &cfg);
+
+        assert!(matches!(cs.kind(), CandidateKind::Sentences(_)));
+        assert_eq!(cs.len(), stream.num_sentences());
+
+        let sents = cs.sentences();
+        for (i, s) in sents.iter().enumerate() {
+            assert_eq!(s.sentence_idx, i as u32);
+            // Every sentence should have at least one non-stopword lemma
+            assert!(!s.lemma_ids.is_empty(), "sentence {i} has no lemma_ids");
+            // Token span should be non-empty
+            assert!(s.token_len() > 0, "sentence {i} has zero token_len");
+        }
+
+        // Verify via trait object dispatch works
+        let selector_box: Box<dyn CandidateSelector> = Box::new(SentenceCandidateSelector);
+        let cs2 = selector_box.select(stream.as_ref(), &cfg);
+        assert_eq!(cs2.len(), cs.len());
     }
 }
