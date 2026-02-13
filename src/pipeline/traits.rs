@@ -6069,9 +6069,12 @@ mod tests {
             graph_stats: Some(crate::pipeline::artifacts::GraphStats {
                 num_nodes: 5,
                 num_edges: 8,
+                is_transformed: false,
             }),
             stage_timings: None,
             residuals: None,
+            convergence_summary: None,
+            cluster_memberships: None,
         };
 
         let result =

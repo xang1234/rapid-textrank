@@ -546,6 +546,9 @@ pub struct TextRankConfig {
     /// Determinism mode (default: fastest; opt-in: reproducible)
     #[serde(default)]
     pub determinism: DeterminismMode,
+    /// Debug output level (default: none — zero overhead).
+    #[serde(default)]
+    pub debug_level: crate::pipeline::artifacts::DebugLevel,
 }
 
 impl Default for TextRankConfig {
@@ -571,6 +574,7 @@ impl Default for TextRankConfig {
             use_pos_in_nodes: true,
             phrase_grouping: PhraseGrouping::ScrubbedText,
             determinism: DeterminismMode::Default,
+            debug_level: crate::pipeline::artifacts::DebugLevel::None,
         }
     }
 }
@@ -664,6 +668,12 @@ impl TextRankConfig {
     /// Builder method: set determinism mode
     pub fn with_determinism(mut self, mode: DeterminismMode) -> Self {
         self.determinism = mode;
+        self
+    }
+
+    /// Builder method: set debug output level
+    pub fn with_debug_level(mut self, level: crate::pipeline::artifacts::DebugLevel) -> Self {
+        self.debug_level = level;
         self
     }
 }

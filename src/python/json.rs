@@ -252,6 +252,7 @@ impl From<JsonConfig> for TextRankConfig {
                 "deterministic" => DeterminismMode::Deterministic,
                 _ => DeterminismMode::Default,
             },
+            debug_level: crate::pipeline::artifacts::DebugLevel::None,
         }
     }
 }

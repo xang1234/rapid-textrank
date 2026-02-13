@@ -17,7 +17,7 @@
 //! Use [`Pipeline::base_textrank()`] (and friends) to build pipelines for
 //! known algorithm variants without spelling out the generics manually.
 
-use crate::pipeline::artifacts::{FormattedResult, TokenStream};
+use crate::pipeline::artifacts::{DebugLevel, FormattedResult, TokenStream};
 use crate::pipeline::observer::{
     PipelineObserver, StageClock, StageReport, StageReportBuilder, STAGE_CANDIDATES, STAGE_FORMAT,
     STAGE_GRAPH, STAGE_GRAPH_TRANSFORM, STAGE_PHRASES, STAGE_PREPROCESS, STAGE_RANK,
@@ -512,11 +512,19 @@ where
         observer.on_stage_end(STAGE_PHRASES, &report);
         observer.on_phrases(&phrases);
 
+        // Build debug payload (opt-in via cfg.debug_level).
+        let debug_payload = super::DebugPayload::build(
+            cfg.debug_level,
+            &graph,
+            &rank_output,
+            DebugLevel::DEFAULT_TOP_K,
+        );
+
         // Stage 5: Format result
         trace_stage!(STAGE_FORMAT);
         observer.on_stage_start(STAGE_FORMAT);
         let clock = StageClock::start();
-        let result = self.formatter.format(&phrases, &rank_output, None, cfg);
+        let result = self.formatter.format(&phrases, &rank_output, debug_payload, cfg);
         let report = StageReport::new(clock.elapsed());
         observer.on_stage_end(STAGE_FORMAT, &report);
 
@@ -2037,5 +2045,66 @@ mod tests {
 
         assert_eq!(result.phrases.len(), 1, "Single candidate should produce one phrase");
         assert!(result.phrases[0].score > 0.0);
+    }
+
+    // ================================================================
+    // Debug enrichment integration tests
+    // ================================================================
+
+    #[test]
+    fn test_pipeline_debug_none_no_payload() {
+        let tokens = sample_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default(); // debug_level = None by default
+        let mut obs = NoopObserver;
+
+        let pipeline = super::BaseTextRankPipeline::base_textrank();
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        assert!(result.debug.is_none(), "debug_level=None should produce no debug payload");
+    }
+
+    #[test]
+    fn test_pipeline_debug_stats_has_graph_stats() {
+        let tokens = sample_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default()
+            .with_debug_level(crate::pipeline::artifacts::DebugLevel::Stats);
+        let mut obs = NoopObserver;
+
+        let pipeline = super::BaseTextRankPipeline::base_textrank();
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        let debug = result.debug.as_ref().expect("Stats level should produce debug payload");
+        let gs = debug.graph_stats.as_ref().expect("Should have graph_stats");
+        assert!(gs.num_nodes > 0);
+        assert!(gs.num_edges > 0);
+
+        let cs = debug.convergence_summary.as_ref().expect("Should have convergence_summary");
+        assert!(cs.iterations > 0);
+        assert!(cs.converged);
+
+        // Stats level should NOT include node scores.
+        assert!(debug.node_scores.is_none());
+    }
+
+    #[test]
+    fn test_pipeline_debug_top_nodes_has_scores() {
+        let tokens = sample_tokens();
+        let stream = TokenStream::from_tokens(&tokens);
+        let cfg = TextRankConfig::default()
+            .with_debug_level(crate::pipeline::artifacts::DebugLevel::TopNodes);
+        let mut obs = NoopObserver;
+
+        let pipeline = super::BaseTextRankPipeline::base_textrank();
+        let result = pipeline.run(stream, &cfg, &mut obs);
+
+        let debug = result.debug.as_ref().expect("TopNodes level should produce debug payload");
+        let scores = debug.node_scores.as_ref().expect("Should have node_scores");
+        assert!(!scores.is_empty());
+        // Scores should be sorted descending.
+        for w in scores.windows(2) {
+            assert!(w[0].1 >= w[1].1, "Node scores should be sorted descending");
+        }
     }
 }

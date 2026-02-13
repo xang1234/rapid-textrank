@@ -1573,16 +1573,33 @@ impl DebugLevel {
 ///
 /// Power users can request this via the `expose` config key.  Fields are
 /// individually optional so callers pay only for what they ask for.
+///
+/// # Population by [`DebugLevel`]
+///
+/// | Field                 | `Stats` | `TopNodes` | `Full` |
+/// |-----------------------|:-------:|:----------:|:------:|
+/// | `graph_stats`         |    ✓    |     ✓      |   ✓    |
+/// | `convergence_summary` |    ✓    |     ✓      |   ✓    |
+/// | `stage_timings`       |    ✓    |     ✓      |   ✓    |
+/// | `node_scores`         |         |     ✓      |   ✓    |
+/// | `residuals`           |         |            |   ✓    |
+/// | `cluster_memberships` |         |            |   ✓    |
 #[derive(Debug, Clone, Default)]
 pub struct DebugPayload {
-    /// Top-K node scores (node lemma → score).
+    /// Top-K node scores (node lemma → score), sorted by score descending.
     pub node_scores: Option<Vec<(String, f64)>>,
     /// Graph statistics.
     pub graph_stats: Option<GraphStats>,
     /// Per-stage timing in milliseconds.
     pub stage_timings: Option<Vec<(String, f64)>>,
-    /// PageRank convergence residuals.
+    /// PageRank convergence residuals per iteration.
     pub residuals: Option<Vec<f64>>,
+    /// Convergence summary (iterations, converged, final delta).
+    pub convergence_summary: Option<ConvergenceSummary>,
+    /// Cluster memberships: `cluster_memberships[i]` lists the candidate
+    /// indices belonging to cluster `i`.  Only populated for topic-family
+    /// pipelines (TopicRank, MultipartiteRank).
+    pub cluster_memberships: Option<Vec<Vec<usize>>>,
 }
 
 /// Summary statistics for the co-occurrence graph.
@@ -1590,6 +1607,98 @@ pub struct DebugPayload {
 pub struct GraphStats {
     pub num_nodes: usize,
     pub num_edges: usize,
+    /// Whether the graph was modified by a [`GraphTransform`] stage.
+    pub is_transformed: bool,
+}
+
+/// Convergence summary from PageRank.
+#[derive(Debug, Clone)]
+pub struct ConvergenceSummary {
+    /// Number of iterations performed.
+    pub iterations: u32,
+    /// Whether PageRank converged within the threshold.
+    pub converged: bool,
+    /// Final L1-norm delta between last two iterations.
+    pub final_delta: f64,
+}
+
+impl DebugPayload {
+    /// Build a [`DebugPayload`] from pipeline artifacts based on the
+    /// requested [`DebugLevel`].
+    ///
+    /// Returns `None` when `level` is [`DebugLevel::None`].
+    ///
+    /// # Arguments
+    ///
+    /// * `level` — Controls which fields are populated.
+    /// * `graph` — The co-occurrence graph (for stats, node labels).
+    /// * `ranks` — PageRank output (for scores, convergence, residuals).
+    /// * `max_top_k` — Maximum number of node scores to include.
+    pub fn build(
+        level: DebugLevel,
+        graph: &Graph,
+        ranks: &RankOutput,
+        max_top_k: usize,
+    ) -> Option<Self> {
+        if !level.is_enabled() {
+            return None;
+        }
+
+        let mut payload = DebugPayload::default();
+
+        // --- Stats level: graph stats + convergence summary ---
+        if level.includes_stats() {
+            payload.graph_stats = Some(GraphStats {
+                num_nodes: graph.num_nodes(),
+                num_edges: graph.num_edges(),
+                is_transformed: graph.is_transformed(),
+            });
+
+            payload.convergence_summary = Some(ConvergenceSummary {
+                iterations: ranks.iterations(),
+                converged: ranks.converged(),
+                final_delta: ranks.final_delta(),
+            });
+        }
+
+        // --- TopNodes level: top-K node scores ---
+        if level.includes_node_scores() {
+            let num_nodes = ranks.num_nodes();
+            let mut scored: Vec<(String, f64)> = (0..num_nodes as u32)
+                .map(|id| (graph.lemma(id).to_string(), ranks.score(id)))
+                .collect();
+
+            // Sort by score descending, then by lemma ascending for stability.
+            scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+
+            scored.truncate(max_top_k);
+            payload.node_scores = Some(scored);
+        }
+
+        // --- Full level: residuals + cluster memberships ---
+        if level.includes_full() {
+            // Convergence residuals (if diagnostics were captured).
+            if let Some(diag) = ranks.diagnostics() {
+                payload.residuals = Some(diag.residuals.clone());
+            }
+
+            // Cluster memberships (topic-family pipelines only).
+            if let Some(assignments) = graph.cluster_assignments() {
+                let num_clusters = assignments.num_clusters() as usize;
+                let mut memberships: Vec<Vec<usize>> = vec![Vec::new(); num_clusters];
+                for (cand_idx, &cluster_id) in assignments.as_slice().iter().enumerate() {
+                    memberships[cluster_id as usize].push(cand_idx);
+                }
+                payload.cluster_memberships = Some(memberships);
+            }
+        }
+
+        Some(payload)
+    }
 }
 
 impl FormattedResult {
@@ -2680,9 +2789,12 @@ mod tests {
             graph_stats: Some(GraphStats {
                 num_nodes: 10,
                 num_edges: 25,
+                is_transformed: false,
             }),
             stage_timings: None,
             residuals: None,
+            convergence_summary: None,
+            cluster_memberships: None,
         });
 
         let d = fr.debug.as_ref().unwrap();
@@ -2809,6 +2921,177 @@ mod tests {
         let clusters = vec![vec![0], vec![1], vec![2]];
         let ca = ClusterAssignments::from_cluster_vecs(&clusters, 3);
         assert_eq!(ca.as_slice(), &[0, 1, 2]);
+    }
+
+    // ================================================================
+    // DebugPayload::build() tests
+    // ================================================================
+
+    /// Helper: build a Graph + RankOutput for debug payload tests.
+    fn debug_test_graph_and_ranks() -> (Graph, RankOutput) {
+        let builder = sample_graph_builder(); // 3 nodes: machine|NOUN, learning|NOUN, great|ADJ
+        let graph = Graph::from_builder(&builder);
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![0.5, 0.3, 0.2],
+                iterations: 42,
+                delta: 1e-7,
+                converged: true,
+            },
+        );
+        (graph, ranks)
+    }
+
+    #[test]
+    fn test_debug_build_none_returns_none() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        assert!(DebugPayload::build(DebugLevel::None, &graph, &ranks, 50).is_none());
+    }
+
+    #[test]
+    fn test_debug_build_stats_populates_graph_stats() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::Stats, &graph, &ranks, 50).unwrap();
+
+        let gs = payload.graph_stats.as_ref().expect("graph_stats should be populated");
+        assert_eq!(gs.num_nodes, 3);
+        assert_eq!(gs.num_edges, 6); // 3 undirected = 6 directed
+        assert!(!gs.is_transformed);
+    }
+
+    #[test]
+    fn test_debug_build_stats_populates_convergence_summary() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::Stats, &graph, &ranks, 50).unwrap();
+
+        let cs = payload.convergence_summary.as_ref().expect("convergence_summary should be populated");
+        assert_eq!(cs.iterations, 42);
+        assert!(cs.converged);
+        assert!((cs.final_delta - 1e-7).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_debug_build_stats_no_node_scores() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::Stats, &graph, &ranks, 50).unwrap();
+
+        assert!(payload.node_scores.is_none(), "Stats level should not include node_scores");
+        assert!(payload.residuals.is_none());
+        assert!(payload.cluster_memberships.is_none());
+    }
+
+    #[test]
+    fn test_debug_build_top_nodes_has_scores() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::TopNodes, &graph, &ranks, 50).unwrap();
+
+        let scores = payload.node_scores.as_ref().expect("node_scores should be populated");
+        assert_eq!(scores.len(), 3);
+        // Should be sorted by score descending.
+        assert_eq!(scores[0].0, "machine|NOUN");
+        assert!((scores[0].1 - 0.5).abs() < 1e-10);
+        assert_eq!(scores[1].0, "learning|NOUN");
+        assert_eq!(scores[2].0, "great|ADJ");
+        // Also includes stats (superset).
+        assert!(payload.graph_stats.is_some());
+        assert!(payload.convergence_summary.is_some());
+    }
+
+    #[test]
+    fn test_debug_build_top_nodes_respects_top_k() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::TopNodes, &graph, &ranks, 2).unwrap();
+
+        let scores = payload.node_scores.as_ref().unwrap();
+        assert_eq!(scores.len(), 2, "Should be truncated to top_k=2");
+        assert_eq!(scores[0].0, "machine|NOUN"); // highest score
+        assert_eq!(scores[1].0, "learning|NOUN");
+    }
+
+    #[test]
+    fn test_debug_build_full_includes_residuals() {
+        // Build with diagnostics enabled.
+        let (graph, _) = debug_test_graph_and_ranks();
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![0.5, 0.3, 0.2],
+                iterations: 3,
+                delta: 1e-7,
+                converged: true,
+            },
+        )
+        .with_diagnostics(RankDiagnostics {
+            residuals: vec![0.1, 0.01, 0.001],
+        });
+
+        let payload = DebugPayload::build(DebugLevel::Full, &graph, &ranks, 50).unwrap();
+
+        let residuals = payload.residuals.as_ref().expect("residuals should be populated at Full level");
+        assert_eq!(residuals.len(), 3);
+        assert!((residuals[0] - 0.1).abs() < 1e-10);
+        // Also includes node_scores and stats (superset).
+        assert!(payload.node_scores.is_some());
+        assert!(payload.graph_stats.is_some());
+    }
+
+    #[test]
+    fn test_debug_build_full_no_residuals_without_diagnostics() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::Full, &graph, &ranks, 50).unwrap();
+
+        // No diagnostics were set, so residuals should be None.
+        assert!(payload.residuals.is_none());
+    }
+
+    #[test]
+    fn test_debug_build_full_includes_cluster_memberships() {
+        let (mut graph, ranks) = debug_test_graph_and_ranks();
+
+        // Simulate a topic-family pipeline with cluster assignments.
+        let clusters = vec![vec![0, 1], vec![2]]; // two clusters
+        let assignments = ClusterAssignments::from_cluster_vecs(&clusters, 3);
+        graph.set_cluster_assignments(assignments);
+
+        let payload = DebugPayload::build(DebugLevel::Full, &graph, &ranks, 50).unwrap();
+
+        let memberships = payload.cluster_memberships.as_ref()
+            .expect("cluster_memberships should be populated for topic-family");
+        assert_eq!(memberships.len(), 2);
+        assert_eq!(memberships[0], vec![0, 1]);
+        assert_eq!(memberships[1], vec![2]);
+    }
+
+    #[test]
+    fn test_debug_build_full_no_clusters_when_not_topic_family() {
+        let (graph, ranks) = debug_test_graph_and_ranks();
+        let payload = DebugPayload::build(DebugLevel::Full, &graph, &ranks, 50).unwrap();
+
+        // No cluster assignments → no cluster memberships.
+        assert!(payload.cluster_memberships.is_none());
+    }
+
+    #[test]
+    fn test_debug_build_node_scores_tiebreak_by_lemma() {
+        // Two nodes with identical scores — should sort by lemma ascending.
+        let mut builder = crate::graph::builder::GraphBuilder::new();
+        let a = builder.get_or_create_node("zebra|NOUN");
+        let b = builder.get_or_create_node("alpha|NOUN");
+        builder.increment_edge(a, b, 1.0);
+        let graph = Graph::from_builder(&builder);
+
+        let ranks = RankOutput::from_pagerank_result(
+            &crate::pagerank::PageRankResult {
+                scores: vec![0.5, 0.5],
+                iterations: 10,
+                delta: 1e-7,
+                converged: true,
+            },
+        );
+
+        let payload = DebugPayload::build(DebugLevel::TopNodes, &graph, &ranks, 50).unwrap();
+        let scores = payload.node_scores.as_ref().unwrap();
+        assert_eq!(scores[0].0, "alpha|NOUN", "Equal scores should sort by lemma ascending");
+        assert_eq!(scores[1].0, "zebra|NOUN");
     }
 
     // ================================================================

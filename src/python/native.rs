@@ -237,6 +237,7 @@ impl PyTextRankConfig {
             use_pos_in_nodes,
             phrase_grouping: phrase_grouping.parse().unwrap_or(PhraseGrouping::Lemma),
             determinism: det_mode,
+            debug_level: crate::pipeline::artifacts::DebugLevel::None,
         };
 
         config
