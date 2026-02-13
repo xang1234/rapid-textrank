@@ -142,8 +142,8 @@ pub struct ModuleSet {
 
 // ─── Preset resolution ──────────────────────────────────────────────────────
 
-/// Valid canonical preset names, used in error hints.
-const VALID_PRESETS: &[&str] = &[
+/// Valid canonical preset names, used in error hints and capability discovery.
+pub const VALID_PRESETS: &[&str] = &[
     "textrank",
     "position_rank",
     "biased_textrank",

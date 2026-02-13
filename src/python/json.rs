@@ -7,7 +7,7 @@ use crate::phrase::chunker::NounChunker;
 use crate::phrase::extraction::extract_keyphrases_with_info;
 use crate::pipeline::artifacts::TokenStream;
 use crate::pipeline::observer::NoopObserver;
-use crate::pipeline::spec::{resolve_spec, PipelineSpec, PipelineSpecV1};
+use crate::pipeline::spec::{resolve_spec, PipelineSpec, PipelineSpecV1, VALID_PRESETS};
 use crate::pipeline::spec_builder::SpecPipelineBuilder;
 use crate::pipeline::validation::{ValidationDiagnostic, ValidationEngine, ValidationReport};
 use crate::types::{DeterminismMode, PhraseGrouping, PosTag, ScoreAggregation, TextRankConfig, Token};
@@ -68,6 +68,10 @@ pub struct JsonDocument {
     /// without running extraction.
     #[serde(default)]
     pub validate_only: bool,
+    /// When `true`, return a capabilities discovery response describing
+    /// supported versions, presets, and module types.
+    #[serde(default)]
+    pub capabilities: bool,
 }
 
 /// Configuration from JSON
@@ -326,6 +330,42 @@ pub struct ValidationResponse {
     pub report: ValidationReport,
 }
 
+/// JSON response for capability discovery requests.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesResponse {
+    /// Crate version (from Cargo.toml).
+    pub version: String,
+    /// Supported pipeline spec version numbers.
+    pub pipeline_spec_versions: Vec<u32>,
+    /// Canonical preset names.
+    pub presets: Vec<String>,
+    /// Module types organized by pipeline stage.
+    pub modules: HashMap<String, Vec<String>>,
+}
+
+/// Build the static capabilities response.
+///
+/// All data is compile-time constant — no tokens, config, or pipeline needed.
+pub fn build_capabilities() -> CapabilitiesResponse {
+    let mut modules = HashMap::new();
+    modules.insert("preprocess".into(), vec!["default".into()]);
+    modules.insert("candidates".into(), vec!["word_nodes".into(), "phrase_candidates".into()]);
+    modules.insert("graph".into(), vec!["cooccurrence_window".into(), "topic_graph".into(), "candidate_graph".into()]);
+    modules.insert("graph_transforms".into(), vec!["remove_intra_cluster_edges".into(), "alpha_boost".into()]);
+    modules.insert("teleport".into(), vec!["uniform".into(), "position".into(), "focus_terms".into(), "topic_weights".into()]);
+    modules.insert("clustering".into(), vec!["hac".into()]);
+    modules.insert("rank".into(), vec!["standard_pagerank".into(), "personalized_pagerank".into()]);
+    modules.insert("phrases".into(), vec!["chunk_phrases".into()]);
+    modules.insert("format".into(), vec!["standard_json".into()]);
+
+    CapabilitiesResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pipeline_spec_versions: vec![1],
+        presets: VALID_PRESETS.iter().map(|s| s.to_string()).collect(),
+        modules,
+    }
+}
+
 /// Validate a pipeline spec (pure Rust, no PyO3 dependency).
 ///
 /// Used by both `extract_from_json` (when `validate_only` is true)
@@ -354,6 +394,13 @@ pub fn extract_from_json(py: Python<'_>, json_input: &str) -> PyResult<String> {
     // Parse input (cheap — no need to release GIL)
     let doc: JsonDocument = serde_json::from_str(json_input)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
+
+    // Handle capabilities discovery (cheapest path, no parsing needed)
+    if doc.capabilities {
+        let response = build_capabilities();
+        return serde_json::to_string(&response)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()));
+    }
 
     // Handle validate-only mode (fast path, no extraction)
     if doc.validate_only {
@@ -1318,5 +1365,65 @@ mod tests {
         assert!(resp.valid);
         // Should have position teleport from the preset
         assert!(resolved.modules.teleport.is_some());
+    }
+
+    // ─── Capability discovery (textranker-04a.7) ────────────────────────
+
+    #[test]
+    fn test_capabilities_response_shape() {
+        let json_input = r#"{"capabilities": true}"#;
+        let doc: JsonDocument = serde_json::from_str(json_input).unwrap();
+        assert!(doc.capabilities);
+
+        let resp = build_capabilities();
+        let json = serde_json::to_value(&resp).unwrap();
+
+        // Must have all four top-level keys
+        assert!(json.get("version").is_some(), "missing 'version'");
+        assert!(json.get("pipeline_spec_versions").is_some(), "missing 'pipeline_spec_versions'");
+        assert!(json.get("presets").is_some(), "missing 'presets'");
+        assert!(json.get("modules").is_some(), "missing 'modules'");
+
+        // version is a non-empty string
+        assert!(!json["version"].as_str().unwrap().is_empty());
+        // pipeline_spec_versions contains 1
+        assert_eq!(json["pipeline_spec_versions"].as_array().unwrap(), &[1]);
+    }
+
+    #[test]
+    fn test_capabilities_modules_has_all_stages() {
+        let resp = build_capabilities();
+        let expected_stages = [
+            "preprocess", "candidates", "graph", "graph_transforms",
+            "teleport", "clustering", "rank", "phrases", "format",
+        ];
+        assert_eq!(resp.modules.len(), expected_stages.len());
+        for stage in &expected_stages {
+            assert!(
+                resp.modules.contains_key(*stage),
+                "missing stage '{stage}' in capabilities modules"
+            );
+            assert!(
+                !resp.modules[*stage].is_empty(),
+                "stage '{stage}' has no module types"
+            );
+        }
+    }
+
+    #[test]
+    fn test_capabilities_presets_match_valid_presets() {
+        let resp = build_capabilities();
+        let expected: Vec<String> = VALID_PRESETS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(resp.presets, expected);
+    }
+
+    #[test]
+    fn test_capabilities_document_no_tokens_needed() {
+        // capabilities requests should parse without tokens or config
+        let doc: JsonDocument = serde_json::from_str(r#"{"capabilities": true}"#).unwrap();
+        assert!(doc.capabilities);
+        assert!(doc.tokens.is_empty());
+        assert!(doc.config.is_none());
+        assert!(doc.pipeline.is_none());
     }
 }
