@@ -355,8 +355,8 @@ pub fn build_capabilities() -> CapabilitiesResponse {
     modules.insert("teleport".into(), vec!["uniform".into(), "position".into(), "focus_terms".into(), "topic_weights".into()]);
     modules.insert("clustering".into(), vec!["hac".into()]);
     modules.insert("rank".into(), vec!["standard_pagerank".into(), "personalized_pagerank".into()]);
-    modules.insert("phrases".into(), vec!["chunk_phrases".into()]);
-    modules.insert("format".into(), vec!["standard_json".into()]);
+    modules.insert("phrases".into(), vec!["chunk_phrases".into(), "sentence_phrases".into()]);
+    modules.insert("format".into(), vec!["standard_json".into(), "sentence_json".into()]);
 
     CapabilitiesResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),

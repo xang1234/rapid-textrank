@@ -610,12 +610,15 @@ pub enum PhraseSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phrase_grouping: Option<PhraseGroupingSpec>,
     },
+    /// Sentence-level phrase assembly (SentenceRank / extractive summarization).
+    SentencePhrases,
 }
 
 impl PhraseSpec {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::ChunkPhrases { .. } => "chunk_phrases",
+            Self::SentencePhrases => "sentence_phrases",
         }
     }
 
@@ -641,6 +644,8 @@ impl PhraseSpec {
                 score_aggregation: score_aggregation.or(*fb_sa),
                 phrase_grouping: phrase_grouping.or(*fb_pg),
             },
+            // Different variants or SentencePhrases — no deep merge needed.
+            _ => self.clone(),
         }
     }
 }
@@ -668,12 +673,18 @@ pub enum PhraseGroupingSpec {
 pub enum FormatSpec {
     /// Standard JSON output format.
     StandardJson,
+    /// Sentence-level JSON output with optional position-based sorting.
+    SentenceJson {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort_by_position: Option<bool>,
+    },
 }
 
 impl FormatSpec {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::StandardJson => "standard_json",
+            Self::SentenceJson { .. } => "sentence_json",
         }
     }
 }
@@ -1448,7 +1459,12 @@ mod tests {
             .type_name(),
             "chunk_phrases"
         );
+        assert_eq!(PhraseSpec::SentencePhrases.type_name(), "sentence_phrases");
         assert_eq!(FormatSpec::StandardJson.type_name(), "standard_json");
+        assert_eq!(
+            FormatSpec::SentenceJson { sort_by_position: None }.type_name(),
+            "sentence_json"
+        );
     }
 
     // ─── resolve_preset ───────────────────────────────────────────────

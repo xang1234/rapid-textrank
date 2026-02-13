@@ -56,7 +56,8 @@ pub use traits::{
     MultipartitePhraseBuilder, MultipartiteTransform, NoopClusterer, NoopGraphTransform,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
     PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, SentenceCandidateSelector,
-    SentenceGraphBuilder, StandardResultFormatter, TeleportBuilder, TopicGraphBuilder,
-    TopicRepresentativeBuilder, TopicWeightsTeleportBuilder, UniformTeleportBuilder,
-    WindowGraphBuilder, WindowStrategy, WordNodeSelector, DEFAULT_WINDOW_SIZE,
+    SentenceFormatter, SentenceGraphBuilder, SentencePhraseBuilder, StandardResultFormatter,
+    TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder, TopicWeightsTeleportBuilder,
+    UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy, WordNodeSelector,
+    DEFAULT_WINDOW_SIZE,
 };

@@ -56,12 +56,13 @@ pub use pipeline::{
     EdgeWeightPolicy, FocusTermsTeleportBuilder, IntraTopicEdgeRemover, JaccardHacClusterer,
     Linkage, MultipartitePhraseBuilder, MultipartiteRankPipeline, MultipartiteTransform,
     NoopClusterer, NoopGraphTransform, NoopPreprocessor, PhraseBuilder, SentenceCandidateSelector,
-    SentenceGraphBuilder, SpecPipelineBuilder, TopicGraphBuilder, TopicRankPipeline,
-    TopicRepresentativeBuilder, TopicWeightsTeleportBuilder, TopicalPageRankPipeline,
-    PhraseCandidateSelector, PositionTeleportBuilder, Preprocessor, ResultFormatter,
-    StandardResultFormatter, TeleportBuilder, TeleportType, TeleportVector, TokenEntry,
-    TokenStream, TokenStreamRef, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
-    WordNodeSelector, DEFAULT_WINDOW_SIZE,
+    SentenceFormatter, SentenceGraphBuilder, SentencePhraseBuilder, SpecPipelineBuilder,
+    TopicGraphBuilder, TopicRankPipeline, TopicRepresentativeBuilder,
+    TopicWeightsTeleportBuilder, TopicalPageRankPipeline, PhraseCandidateSelector,
+    PositionTeleportBuilder, Preprocessor, ResultFormatter, StandardResultFormatter,
+    TeleportBuilder, TeleportType, TeleportVector, TokenEntry, TokenStream, TokenStreamRef,
+    UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy, WordNodeSelector,
+    DEFAULT_WINDOW_SIZE,
 };
 // Note: pipeline::GraphBuilder trait is NOT re-exported here to avoid
 // collision with graph::builder::GraphBuilder (the mutable builder struct).

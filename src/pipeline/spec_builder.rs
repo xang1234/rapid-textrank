@@ -33,9 +33,9 @@ use crate::pipeline::traits::{
     JaccardHacClusterer, MultipartitePhraseBuilder, MultipartiteTransform, NoopGraphTransform,
     NoopPreprocessor, PageRankRanker, PhraseBuilder, PhraseCandidateSelector,
     PositionTeleportBuilder, Preprocessor, Ranker, ResultFormatter, SentenceCandidateSelector,
-    StandardResultFormatter, TeleportBuilder, TopicGraphBuilder, TopicRepresentativeBuilder,
-    TopicWeightsTeleportBuilder, UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy,
-    WordNodeSelector,
+    SentenceFormatter, SentencePhraseBuilder, StandardResultFormatter, TeleportBuilder,
+    TopicGraphBuilder, TopicRepresentativeBuilder, TopicWeightsTeleportBuilder,
+    UniformTeleportBuilder, WindowGraphBuilder, WindowStrategy, WordNodeSelector,
 };
 use crate::pipeline::artifacts::{
     CandidateSetRef, Graph, TokenStreamRef,
@@ -290,18 +290,29 @@ impl SpecPipelineBuilder {
             Some(crate::pipeline::spec::PhraseSpec::ChunkPhrases { .. }) => {
                 Box::new(ChunkPhraseBuilder)
             }
+            Some(crate::pipeline::spec::PhraseSpec::SentencePhrases) => {
+                Box::new(SentencePhraseBuilder)
+            }
             None => {
                 // Infer from graph type.
                 match &modules.graph {
                     Some(GraphSpec::TopicGraph) => Box::new(TopicRepresentativeBuilder),
                     Some(GraphSpec::CandidateGraph) => Box::new(MultipartitePhraseBuilder),
+                    Some(GraphSpec::SentenceGraph { .. }) => Box::new(SentencePhraseBuilder),
                     _ => Box::new(ChunkPhraseBuilder),
                 }
             }
         };
 
         // ── Format ────────────────────────────────────────────────────
-        let formatter: Box<dyn ResultFormatter> = Box::new(StandardResultFormatter);
+        let formatter: Box<dyn ResultFormatter> = match &modules.format {
+            Some(crate::pipeline::spec::FormatSpec::SentenceJson { sort_by_position }) => {
+                Box::new(SentenceFormatter {
+                    sort_by_position: sort_by_position.unwrap_or(false),
+                })
+            }
+            _ => Box::new(StandardResultFormatter),
+        };
 
         Ok(Pipeline {
             preprocessor,

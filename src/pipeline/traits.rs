@@ -1713,6 +1713,112 @@ impl ResultFormatter for StandardResultFormatter {
 }
 
 // ============================================================================
+// SentenceFormatter — position-aware result formatter (stage 6, sentence)
+// ============================================================================
+
+/// Result formatter with optional sort-by-position for coherent summaries.
+///
+/// When `sort_by_position` is `true`, phrases are sorted by their first
+/// character offset ascending (document order) rather than by score
+/// descending.  This produces extractive summaries that read coherently.
+///
+/// When `false` (the default), behaviour is identical to
+/// [`StandardResultFormatter`]: phrases are sorted by score descending.
+#[derive(Debug, Clone, Copy)]
+pub struct SentenceFormatter {
+    /// If `true`, sort output sentences by document position instead of score.
+    pub sort_by_position: bool,
+}
+
+impl Default for SentenceFormatter {
+    fn default() -> Self {
+        Self {
+            sort_by_position: false,
+        }
+    }
+}
+
+impl SentenceFormatter {
+    /// Set whether to sort by document position.
+    pub fn with_sort_by_position(mut self, sort: bool) -> Self {
+        self.sort_by_position = sort;
+        self
+    }
+}
+
+impl ResultFormatter for SentenceFormatter {
+    fn format(
+        &self,
+        phrases: &PhraseSet,
+        ranks: &RankOutput,
+        debug: Option<DebugPayload>,
+        cfg: &TextRankConfig,
+    ) -> FormattedResult {
+        use crate::types::Phrase;
+
+        // --- 1. Convert PhraseEntry → Phrase (rank=0 placeholder) ---
+        let mut formatted_phrases: Vec<Phrase> = phrases
+            .entries()
+            .iter()
+            .map(|entry| {
+                let text = entry.surface.clone().unwrap_or_default();
+                let lemma = entry.lemma_text.clone().unwrap_or_default();
+                let offsets = entry
+                    .spans
+                    .as_ref()
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .map(|&(s, e)| (s as usize, e as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Phrase {
+                    text,
+                    lemma,
+                    score: entry.score,
+                    count: entry.count as usize,
+                    offsets,
+                    rank: 0,
+                }
+            })
+            .collect();
+
+        // --- 2. Sort ---
+        if self.sort_by_position {
+            // Sort by first character offset ascending (document order).
+            formatted_phrases.sort_by(|a, b| {
+                let a_pos = a.offsets.first().map(|o| o.0).unwrap_or(usize::MAX);
+                let b_pos = b.offsets.first().map(|o| o.0).unwrap_or(usize::MAX);
+                a_pos.cmp(&b_pos)
+            });
+        } else if cfg.determinism.is_deterministic() {
+            formatted_phrases.sort_by(|a, b| a.stable_cmp(b));
+        } else {
+            formatted_phrases
+                .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // --- 3. Assign 1-indexed ranks after sorting ---
+        for (i, phrase) in formatted_phrases.iter_mut().enumerate() {
+            phrase.rank = i + 1;
+        }
+
+        let result = FormattedResult::new(
+            formatted_phrases,
+            ranks.converged(),
+            ranks.iterations(),
+        );
+
+        match debug {
+            Some(d) => result.with_debug(d),
+            None => result,
+        }
+    }
+}
+
+// ============================================================================
 // PhraseBuilder — token + rank → scored phrases (stage 4)
 // ============================================================================
 
@@ -2374,6 +2480,88 @@ impl PhraseBuilder for MultipartitePhraseBuilder {
         });
 
         // --- 4. Truncate to top_n ---
+        if cfg.top_n > 0 && entries.len() > cfg.top_n {
+            entries.truncate(cfg.top_n);
+        }
+
+        PhraseSet::from_entries(entries)
+    }
+}
+
+// ============================================================================
+// SentencePhraseBuilder — sentence-level phrase assembly (stage 5, sentence)
+// ============================================================================
+
+/// Builds scored sentence entries from PageRank output on a sentence graph.
+///
+/// This is the [`PhraseBuilder`] for SentenceRank / extractive summarization.
+/// Each sentence candidate maps 1:1 to a graph node, so the builder simply:
+///
+/// 1. Matches `CandidateKind::Sentences` (returns empty for other kinds).
+/// 2. For each sentence, looks up its PageRank score via `ranks.score(i)`.
+/// 3. Materializes the sentence surface text by joining token texts.
+/// 4. Builds a [`PhraseEntry`] with char-offset spans.
+/// 5. Sorts by score descending and truncates to `cfg.top_n`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SentencePhraseBuilder;
+
+impl PhraseBuilder for SentencePhraseBuilder {
+    fn build(
+        &self,
+        tokens: TokenStreamRef<'_>,
+        candidates: CandidateSetRef<'_>,
+        ranks: &RankOutput,
+        graph: &Graph,
+        cfg: &TextRankConfig,
+    ) -> PhraseSet {
+        let _ = graph; // not used but required by trait signature
+
+        let sentences = match candidates.kind() {
+            CandidateKind::Sentences(s) => s,
+            _ => return PhraseSet::empty(),
+        };
+
+        if sentences.is_empty() {
+            return PhraseSet::empty();
+        }
+
+        let mut entries: Vec<PhraseEntry> = Vec::with_capacity(sentences.len());
+
+        for (i, sent) in sentences.iter().enumerate() {
+            let score = ranks.score(i as u32);
+
+            // Join token texts with spaces to materialize the sentence surface form.
+            let start = sent.start_token as usize;
+            let end = sent.end_token as usize;
+            let text = tokens.tokens()[start..end]
+                .iter()
+                .map(|e| tokens.text(e))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            entries.push(PhraseEntry {
+                lemma_ids: sent.lemma_ids.clone(),
+                score,
+                count: 1,
+                surface: Some(text),
+                lemma_text: Some(String::new()),
+                spans: Some(vec![(sent.start_char, sent.end_char)]),
+            });
+        }
+
+        // Sort by score descending with deterministic tie-breakers.
+        entries.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let a_pos = a.spans.as_ref().and_then(|s| s.first().map(|p| p.0)).unwrap_or(u32::MAX);
+                    let b_pos = b.spans.as_ref().and_then(|s| s.first().map(|p| p.0)).unwrap_or(u32::MAX);
+                    a_pos.cmp(&b_pos)
+                })
+        });
+
+        // Truncate to top_n.
         if cfg.top_n > 0 && entries.len() > cfg.top_n {
             entries.truncate(cfg.top_n);
         }
@@ -7679,5 +7867,189 @@ mod tests {
         let selector_box: Box<dyn CandidateSelector> = Box::new(SentenceCandidateSelector);
         let cs2 = selector_box.select(stream.as_ref(), &cfg);
         assert_eq!(cs2.len(), cs.len());
+    }
+
+    // ================================================================
+    // SentencePhraseBuilder tests
+    // ================================================================
+
+    /// Helper: build a sentence-level pipeline through candidates + graph + rank,
+    /// then return the artifacts needed for SentencePhraseBuilder.
+    fn sentence_pipeline_artifacts(
+        tokens: &[Token],
+        cfg: &TextRankConfig,
+    ) -> (TokenStream, CandidateSet, Graph, RankOutput) {
+        let stream = TokenStream::from_tokens(tokens);
+        let candidates = SentenceCandidateSelector.select(stream.as_ref(), cfg);
+        let graph = SentenceGraphBuilder::default().build(stream.as_ref(), candidates.as_ref(), cfg);
+        let ranks = PageRankRanker.rank(&graph, None, cfg);
+        (stream, candidates, graph, ranks)
+    }
+
+    #[test]
+    fn test_sentence_phrase_builder_basic() {
+        let tokens = rich_tokens(); // 2 sentences
+        let cfg = TextRankConfig::default();
+        let (stream, candidates, graph, ranks) = sentence_pipeline_artifacts(&tokens, &cfg);
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert_eq!(phrases.len(), 2, "should have 2 sentence entries");
+
+        // Every entry should have non-zero score and non-empty surface text.
+        for entry in phrases.entries() {
+            assert!(entry.score > 0.0, "score should be positive");
+            assert!(entry.surface.as_ref().unwrap().len() > 0, "surface should be non-empty");
+            assert!(entry.count == 1, "count should be 1 for sentences");
+            assert!(entry.spans.is_some(), "spans should be present");
+        }
+
+        // Entries should be sorted by score descending.
+        let scores: Vec<f64> = phrases.entries().iter().map(|e| e.score).collect();
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "entries should be sorted by score descending");
+        }
+    }
+
+    #[test]
+    fn test_sentence_phrase_builder_wrong_kind() {
+        // Word candidates → SentencePhraseBuilder should return empty.
+        let tokens = rich_tokens();
+        let cfg = TextRankConfig::default();
+        let stream = TokenStream::from_tokens(&tokens);
+        let candidates = WordNodeSelector.select(stream.as_ref(), &cfg);
+        let graph = WindowGraphBuilder::base_textrank().build(stream.as_ref(), candidates.as_ref(), &cfg);
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(phrases.is_empty(), "should be empty for word candidates");
+    }
+
+    #[test]
+    fn test_sentence_phrase_builder_empty() {
+        let cfg = TextRankConfig::default();
+        let stream = TokenStream::from_tokens(&[]);
+        let candidates = SentenceCandidateSelector.select(stream.as_ref(), &cfg);
+        let graph = SentenceGraphBuilder::default().build(stream.as_ref(), candidates.as_ref(), &cfg);
+        let ranks = PageRankRanker.rank(&graph, None, &cfg);
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert!(phrases.is_empty(), "should be empty for no sentences");
+    }
+
+    #[test]
+    fn test_sentence_phrase_builder_top_n() {
+        // 3-sentence token set: rich_tokens gives 2, add a third sentence.
+        let mut tokens = rich_tokens();
+        tokens.push(Token::new("Data", "data", PosTag::Noun, 41, 45, 2, 7));
+        tokens.push(Token::new("science", "science", PosTag::Noun, 46, 53, 2, 8));
+
+        let mut cfg = TextRankConfig::default();
+        cfg.top_n = 2; // request only top 2 of 3 sentences
+
+        let (stream, candidates, graph, ranks) = sentence_pipeline_artifacts(&tokens, &cfg);
+        assert_eq!(candidates.len(), 3, "should have 3 sentence candidates");
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        assert_eq!(phrases.len(), 2, "should be truncated to top_n=2");
+    }
+
+    // ================================================================
+    // SentenceFormatter tests
+    // ================================================================
+
+    #[test]
+    fn test_sentence_formatter_by_score() {
+        let tokens = rich_tokens();
+        let cfg = TextRankConfig::default();
+        let (stream, candidates, graph, ranks) = sentence_pipeline_artifacts(&tokens, &cfg);
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        let formatter = SentenceFormatter::default(); // sort_by_position = false
+        let result = formatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(result.phrases.len(), 2);
+        // Should be sorted by score descending.
+        for w in result.phrases.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "should be sorted by score descending: {} >= {}",
+                w[0].score,
+                w[1].score,
+            );
+        }
+        // Ranks should be 1-indexed.
+        for (i, p) in result.phrases.iter().enumerate() {
+            assert_eq!(p.rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_sentence_formatter_by_position() {
+        let tokens = rich_tokens();
+        let cfg = TextRankConfig::default();
+        let (stream, candidates, graph, ranks) = sentence_pipeline_artifacts(&tokens, &cfg);
+
+        let phrases = SentencePhraseBuilder.build(
+            stream.as_ref(),
+            candidates.as_ref(),
+            &ranks,
+            &graph,
+            &cfg,
+        );
+
+        let formatter = SentenceFormatter::default().with_sort_by_position(true);
+        let result = formatter.format(&phrases, &ranks, None, &cfg);
+
+        assert_eq!(result.phrases.len(), 2);
+        // Should be sorted by first offset ascending (document order).
+        for w in result.phrases.windows(2) {
+            let pos_a = w[0].offsets.first().map(|o| o.0).unwrap_or(usize::MAX);
+            let pos_b = w[1].offsets.first().map(|o| o.0).unwrap_or(usize::MAX);
+            assert!(
+                pos_a <= pos_b,
+                "should be sorted by position: {} <= {}",
+                pos_a,
+                pos_b,
+            );
+        }
+        // Ranks should be 1-indexed.
+        for (i, p) in result.phrases.iter().enumerate() {
+            assert_eq!(p.rank, i + 1);
+        }
     }
 }
