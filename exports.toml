@@ -1,0 +1,33 @@
+# exports.toml — Single source of truth for Rust-to-Python exports.
+#
+# Every symbol registered in src/python/mod.rs::register_module() must
+# appear here.  The CI test validates both directions:
+#   1. Every manifest entry is importable from `rapid_textrank`
+#   2. Every non-underscore symbol in `rapid_textrank._rust` is in the manifest
+#
+# Format:  name = {}                           (always present)
+#          name = { feature = "feature-name" }  (feature-gated)
+
+[classes]
+Phrase = {}
+TextRankResult = {}
+TextRankConfig = {}
+BaseTextRank = {}
+PositionRank = {}
+BiasedTextRank = {}
+SingleRank = {}
+TopicalPageRank = {}
+MultipartiteRank = {}
+SentenceRank = { feature = "sentence-rank" }
+BatchIter = {}
+
+[functions]
+get_stopwords = {}
+extract_from_json = {}
+extract_batch_from_json = {}
+extract_jsonl_from_json = {}
+validate_pipeline_spec = {}
+extract_batch_iter = {}
+
+[constants]
+__version__ = {}

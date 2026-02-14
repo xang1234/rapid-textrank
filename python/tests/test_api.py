@@ -17,18 +17,79 @@ def test_import():
     assert hasattr(rapid_textrank, "SingleRank")
 
 
-def test_all_rust_classes_exported():
-    """Every pyclass in _rust must be re-exported from rapid_textrank."""
-    import rapid_textrank._rust as _rust
-    import rapid_textrank
+def _find_exports_toml():
+    """Walk up from this file to find exports.toml at the repo root."""
+    import pathlib
 
-    rust_classes = {
-        name for name, obj in vars(_rust).items()
-        if isinstance(obj, type) and not name.startswith("_")
-    }
+    d = pathlib.Path(__file__).resolve().parent
+    for _ in range(10):
+        candidate = d / "exports.toml"
+        if candidate.exists():
+            return candidate
+        d = d.parent
+    raise FileNotFoundError("exports.toml not found in any parent directory")
+
+
+def _load_manifest():
+    """Parse exports.toml and return (all_names, feature_gated_names)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+
+    path = _find_exports_toml()
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    all_names = set()
+    feature_gated = set()
+    for section in ("classes", "functions", "constants"):
+        for name, meta in data.get(section, {}).items():
+            all_names.add(name)
+            if meta.get("feature"):
+                feature_gated.add(name)
+    return all_names, feature_gated
+
+
+def test_all_rust_symbols_match_manifest():
+    """Bidirectional check: manifest <-> _rust module symbols."""
+    import rapid_textrank
+    import rapid_textrank._rust as _rust
+
+    manifest_names, feature_gated = _load_manifest()
     init_names = set(dir(rapid_textrank))
-    missing = rust_classes - init_names
-    assert not missing, f"Classes in _rust but not in __init__.py: {missing}"
+    rust_names = {n for n in dir(_rust) if not n.startswith("_")}
+
+    # Direction 1: manifest -> Python
+    # Every manifest entry must be importable. Feature-gated items that are
+    # absent from _rust are tolerated (the feature may be compiled out).
+    missing_from_init = set()
+    for name in manifest_names:
+        if name in feature_gated and name not in rust_names:
+            continue  # feature compiled out, acceptable
+        if name not in init_names:
+            missing_from_init.add(name)
+    assert not missing_from_init, (
+        f"In exports.toml but not importable from rapid_textrank: {missing_from_init}"
+    )
+
+    # Direction 2: _rust -> manifest
+    # Every public symbol in _rust must be in the manifest.
+    # Module-intrinsic dunders (__name__, __doc__, etc.) are excluded via
+    # an allowlist; all other dunders (e.g. __version__) are checked.
+    _module_dunders = frozenset({
+        "__name__", "__doc__", "__file__", "__loader__",
+        "__package__", "__spec__", "__all__", "__builtins__",
+        "__cached__", "__path__",
+    })
+    rust_public = {n for n in dir(_rust) if not n.startswith("_")}
+    rust_dunders = {n for n in dir(_rust)
+                    if n.startswith("__") and n.endswith("__")
+                    } - _module_dunders
+    missing_from_manifest = (rust_public | rust_dunders) - manifest_names
+    assert not missing_from_manifest, (
+        f"In rapid_textrank._rust but not in exports.toml: {missing_from_manifest}"
+    )
 
 
 def test_version():

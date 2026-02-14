@@ -102,7 +102,7 @@ jobs:
           python -m pip install $wheel.FullName
 
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest "tomli>=2.0; python_version < '3.11'"
 
       - name: Run Python tests
         run: pytest python/tests/ -v
