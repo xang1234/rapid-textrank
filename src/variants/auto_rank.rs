@@ -5,6 +5,7 @@
 //! list plus consensus metadata.
 
 use crate::phrase::extraction::{extract_keyphrases_with_info, ExtractionResult};
+use crate::pipeline::artifacts::{ConvergenceSummary, DebugPayload, GraphStats};
 use crate::types::{Phrase, TextRankConfig, Token};
 use crate::variants::biased_textrank::BiasedTextRank;
 use crate::variants::multipartite_rank::MultipartiteRank;
@@ -173,7 +174,7 @@ impl AutoRank {
             };
         }
 
-        let fusion_top_n = self.config.top_n.saturating_mul(3).max(20);
+        let fusion_top_n = self.fusion_top_n();
         let member_config = self.member_config(fusion_top_n);
         let selected_variants = self.selected_variants();
         let total_executed_weight: f64 = selected_variants
@@ -193,12 +194,13 @@ impl AutoRank {
             .collect();
 
         let fused = self.fuse_candidates(&executions);
+        let debug = self.aggregate_debug_payload(&executions);
         if fused.is_empty() {
             return ExtractionResult {
                 phrases: Vec::new(),
                 converged: true,
                 iterations: 0,
-                debug: None,
+                debug,
                 consensus: Some(Self::empty_consensus(
                     "AutoRank skipped execution because no eligible candidates were found."
                         .to_string(),
@@ -260,7 +262,7 @@ impl AutoRank {
             phrases,
             converged,
             iterations,
-            debug: None,
+            debug,
             consensus: Some(AutoRankConsensus {
                 selected_variants: selected_variants
                     .iter()
@@ -273,10 +275,17 @@ impl AutoRank {
         }
     }
 
+    fn fusion_top_n(&self) -> usize {
+        if self.config.top_n == 0 {
+            0
+        } else {
+            self.config.top_n.saturating_mul(3).max(20)
+        }
+    }
+
     fn member_config(&self, fusion_top_n: usize) -> TextRankConfig {
         let mut config = self.config.clone();
         config.top_n = fusion_top_n;
-        config.debug_level = crate::pipeline::artifacts::DebugLevel::None;
         config
     }
 
@@ -507,6 +516,163 @@ impl AutoRank {
             phrase_support: Vec::new(),
         }
     }
+
+    fn aggregate_debug_payload(&self, executions: &[VariantExecution]) -> Option<DebugPayload> {
+        if !self.config.debug_level.is_enabled() {
+            return None;
+        }
+
+        let payloads: Vec<(Variant, &DebugPayload)> = executions
+            .iter()
+            .filter_map(|execution| {
+                execution
+                    .result
+                    .debug
+                    .as_ref()
+                    .map(|debug| (execution.variant, debug))
+            })
+            .collect();
+
+        if payloads.is_empty() {
+            return None;
+        }
+
+        let mut debug = DebugPayload::default();
+
+        if self.config.debug_level.includes_stats() {
+            let mut total_nodes = 0usize;
+            let mut total_edges = 0usize;
+            let mut any_transformed = false;
+            let mut graph_stats_count = 0usize;
+
+            for (_, payload) in &payloads {
+                if let Some(stats) = payload.graph_stats.as_ref() {
+                    total_nodes += stats.num_nodes;
+                    total_edges += stats.num_edges;
+                    any_transformed |= stats.is_transformed;
+                    graph_stats_count += 1;
+                }
+            }
+
+            if graph_stats_count > 0 {
+                debug.graph_stats = Some(GraphStats {
+                    num_nodes: total_nodes,
+                    num_edges: total_edges,
+                    avg_degree: if total_nodes > 0 {
+                        total_edges as f64 / total_nodes as f64
+                    } else {
+                        0.0
+                    },
+                    is_transformed: any_transformed,
+                });
+            }
+
+            let mut max_iterations = 0u32;
+            let mut all_converged = true;
+            let mut max_final_delta = 0.0f64;
+            let mut convergence_count = 0usize;
+
+            for (_, payload) in &payloads {
+                if let Some(summary) = payload.convergence_summary.as_ref() {
+                    max_iterations = max_iterations.max(summary.iterations);
+                    all_converged &= summary.converged;
+                    max_final_delta = max_final_delta.max(summary.final_delta);
+                    convergence_count += 1;
+                }
+            }
+
+            if convergence_count > 0 {
+                debug.convergence_summary = Some(ConvergenceSummary {
+                    iterations: max_iterations,
+                    converged: all_converged,
+                    final_delta: max_final_delta,
+                });
+            }
+
+            let mut stage_timings = Vec::new();
+            for (variant, payload) in &payloads {
+                if let Some(timings) = payload.stage_timings.as_ref() {
+                    for (stage, millis) in timings {
+                        stage_timings
+                            .push((format!("{}.{}", variant.canonical_name(), stage), *millis));
+                    }
+                }
+            }
+
+            if !stage_timings.is_empty() {
+                debug.stage_timings = Some(stage_timings);
+            }
+        }
+
+        if self.config.debug_level.includes_node_scores() {
+            let mut node_scores = Vec::new();
+            for (variant, payload) in &payloads {
+                if let Some(scores) = payload.node_scores.as_ref() {
+                    for (node, score) in scores {
+                        node_scores
+                            .push((format!("{}:{}", variant.canonical_name(), node), *score));
+                    }
+                }
+            }
+
+            if !node_scores.is_empty() {
+                node_scores.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                node_scores.truncate(self.config.debug_top_k);
+                debug.node_scores = Some(node_scores);
+            }
+        }
+
+        if self.config.debug_level.includes_full() {
+            let residuals = payloads
+                .iter()
+                .filter_map(|(_, payload)| payload.residuals.as_ref())
+                .flat_map(|values| values.iter().copied())
+                .collect::<Vec<_>>();
+            if !residuals.is_empty() {
+                debug.residuals = Some(residuals);
+            }
+
+            let mut cluster_memberships = payloads
+                .iter()
+                .filter_map(|(_, payload)| payload.cluster_memberships.clone())
+                .collect::<Vec<_>>();
+            if cluster_memberships.len() == 1 {
+                debug.cluster_memberships = cluster_memberships.pop();
+            }
+
+            let mut cluster_details = payloads
+                .iter()
+                .filter_map(|(_, payload)| payload.cluster_details.clone())
+                .collect::<Vec<_>>();
+            if cluster_details.len() == 1 {
+                debug.cluster_details = cluster_details.pop();
+            }
+
+            let phrase_diagnostics = payloads
+                .iter()
+                .filter_map(|(_, payload)| payload.phrase_diagnostics.as_ref())
+                .flat_map(|events| events.iter().cloned())
+                .collect::<Vec<_>>();
+            if !phrase_diagnostics.is_empty() {
+                debug.phrase_diagnostics = Some(phrase_diagnostics);
+            }
+
+            let dropped_candidates = payloads
+                .iter()
+                .filter_map(|(_, payload)| payload.dropped_candidates.as_ref())
+                .flat_map(|drops| drops.iter().cloned())
+                .collect::<Vec<_>>();
+            if !dropped_candidates.is_empty() {
+                debug.dropped_candidates = Some(dropped_candidates);
+            }
+        }
+
+        Some(debug)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -663,5 +829,91 @@ mod tests {
             let result = AutoRank::with_config(config.clone()).extract_with_info(&tokens);
             assert_eq!(baseline, result);
         }
+    }
+
+    fn make_many_tokens(num_terms: usize) -> Vec<Token> {
+        let mut tokens = Vec::with_capacity(num_terms * 3);
+        let mut offset = 0usize;
+        for idx in 0..num_terms {
+            tokens.push(Token::new(
+                format!("Term{idx}"),
+                format!("term{idx}"),
+                PosTag::Noun,
+                offset,
+                offset + 5,
+                idx,
+                tokens.len(),
+            ));
+            offset += 6;
+            tokens.push(Token::new(
+                "works",
+                "work",
+                PosTag::Verb,
+                offset,
+                offset + 5,
+                idx,
+                tokens.len(),
+            ));
+            offset += 6;
+            tokens.push(Token::new(
+                ".",
+                ".",
+                PosTag::Punctuation,
+                offset,
+                offset + 1,
+                idx,
+                tokens.len(),
+            ));
+            if let Some(token) = tokens.last_mut() {
+                token.is_stopword = true;
+            }
+            offset += 2;
+        }
+        tokens
+    }
+
+    #[test]
+    fn test_top_n_zero_matches_large_limit() {
+        let tokens = make_many_tokens(40);
+        let config_all = TextRankConfig::default().with_top_n(0);
+        let config_large = TextRankConfig::default().with_top_n(1000);
+
+        let all = AutoRank::with_config(config_all).extract_with_info(&tokens);
+        let large = AutoRank::with_config(config_large).extract_with_info(&tokens);
+
+        assert_eq!(all.phrases, large.phrases);
+    }
+
+    #[test]
+    fn test_debug_stats_are_aggregated() {
+        let config = TextRankConfig::default()
+            .with_top_n(5)
+            .with_debug_level(crate::pipeline::artifacts::DebugLevel::Stats);
+
+        let result = AutoRank::with_config(config).extract_with_info(&make_tokens());
+        let debug = result.debug.expect("debug should be present");
+
+        assert!(debug.graph_stats.is_some());
+        assert!(debug.convergence_summary.is_some());
+    }
+
+    #[test]
+    fn test_debug_top_nodes_preserves_variant_provenance() {
+        let config = TextRankConfig::default()
+            .with_top_n(5)
+            .with_debug_level(crate::pipeline::artifacts::DebugLevel::TopNodes)
+            .with_debug_top_k(10);
+
+        let result = AutoRank::with_config(config).extract_with_info(&make_tokens());
+        let debug = result.debug.expect("debug should be present");
+        let node_scores = debug.node_scores.expect("node scores should be present");
+
+        assert!(!node_scores.is_empty());
+        assert!(
+            node_scores
+                .iter()
+                .any(|(label, _)| label.starts_with("textrank:")),
+            "aggregated node scores should preserve variant provenance"
+        );
     }
 }

@@ -10,7 +10,7 @@
 | `max_iterations` | `int` | `100` | Maximum number of PageRank iterations. |
 | `convergence_threshold` | `float` | `1e-6` | PageRank convergence threshold. Iteration stops when the score change between iterations falls below this value. |
 | `window_size` | `int` | `3` | Co-occurrence window size. Two words are connected in the graph if they appear within this many words of each other. |
-| `top_n` | `int` | `10` | Number of top-scoring phrases to return. |
+| `top_n` | `int` | `10` | Number of top-scoring phrases to return. Set `0` to return all phrases. |
 | `min_phrase_length` | `int` | `1` | Minimum number of words in a phrase. Set to `2` to exclude single-word results. |
 | `max_phrase_length` | `int` | `4` | Maximum number of words in a phrase. |
 | `score_aggregation` | `str` | `"sum"` | How to combine individual word scores into a phrase score. Options: `"sum"`, `"mean"`, `"max"`, `"rms"` (root mean square). |

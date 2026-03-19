@@ -1,6 +1,6 @@
 # Debug and Introspection Outputs
 
-rapid_textrank provides a tiered debug system that lets you see inside the pipeline — from graph statistics to per-iteration convergence residuals. This is useful when you want to understand *why* certain keywords were ranked higher than others.
+rapid_textrank provides a tiered debug system that lets you see inside the pipeline — from graph statistics to per-iteration convergence residuals. This is useful when you want to understand *why* certain keywords were ranked higher than others. `AutoRank` preserves this contract by aggregating the per-variant debug payloads from the ensemble run into a single result-level `debug` object.
 
 ---
 

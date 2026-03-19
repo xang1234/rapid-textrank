@@ -372,6 +372,81 @@ class TestAutoRank:
         assert "consensus" in result
         assert "selected_variants" in result["consensus"]
 
+    def test_top_n_zero_matches_large_limit_for_json_auto_rank(self):
+        """AutoRank should preserve the shared top_n=0 means all contract."""
+        from rapid_textrank import extract_from_json
+
+        tokens = []
+        offset = 0
+        for i in range(40):
+            tokens.append(
+                {
+                    "text": f"Term{i}",
+                    "lemma": f"term{i}",
+                    "pos": "NOUN",
+                    "start": offset,
+                    "end": offset + 5,
+                    "sentence_idx": i,
+                    "token_idx": len(tokens),
+                    "is_stopword": False,
+                }
+            )
+            offset += 6
+            tokens.append(
+                {
+                    "text": "works",
+                    "lemma": "work",
+                    "pos": "VERB",
+                    "start": offset,
+                    "end": offset + 5,
+                    "sentence_idx": i,
+                    "token_idx": len(tokens),
+                    "is_stopword": False,
+                }
+            )
+            offset += 6
+            tokens.append(
+                {
+                    "text": ".",
+                    "lemma": ".",
+                    "pos": "PUNCT",
+                    "start": offset,
+                    "end": offset + 1,
+                    "sentence_idx": i,
+                    "token_idx": len(tokens),
+                    "is_stopword": True,
+                }
+            )
+            offset += 2
+
+        base_doc = {
+            "tokens": tokens,
+            "variant": "auto_rank",
+            "config": {"include_pos": ["NOUN"]},
+        }
+        all_doc = {**base_doc, "config": {**base_doc["config"], "top_n": 0}}
+        large_doc = {**base_doc, "config": {**base_doc["config"], "top_n": 1000}}
+
+        all_result = json.loads(extract_from_json(json.dumps(all_doc)))
+        large_result = json.loads(extract_from_json(json.dumps(large_doc)))
+
+        assert all_result["phrases"] == large_result["phrases"]
+
+    def test_debug_config_is_preserved(self):
+        """AutoRank should return debug payloads when the config requests them."""
+        from rapid_textrank import AutoRank, TextRankConfig
+
+        config = TextRankConfig(debug_level="stats")
+        extractor = AutoRank(config=config, top_n=5)
+        result = extractor.extract_keywords(
+            "Machine learning improves search ranking. "
+            "Topic models improve keyword extraction."
+        )
+
+        assert result.debug is not None
+        assert result.debug.graph_stats is not None
+        assert result.debug.convergence_summary is not None
+
 
 class TestTextRankConfig:
     """Tests for TextRankConfig."""
