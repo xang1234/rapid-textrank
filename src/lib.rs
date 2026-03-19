@@ -72,8 +72,12 @@ pub use pipeline::{
 // `pipeline::traits::GraphBuilder`.
 pub use summarizer::selector::SentenceSelector;
 pub use variants::{
-    biased_textrank::BiasedTextRank, multipartite_rank::MultipartiteRank,
-    position_rank::PositionRank, single_rank::SingleRank, topical_pagerank::TopicalPageRank,
+    auto_rank::{AutoRank, AutoRankConsensus, AutoRankPhraseSupport, AutoRankVariantRun},
+    biased_textrank::BiasedTextRank,
+    multipartite_rank::MultipartiteRank,
+    position_rank::PositionRank,
+    single_rank::SingleRank,
+    topical_pagerank::TopicalPageRank,
 };
 
 /// Library version

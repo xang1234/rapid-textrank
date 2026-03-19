@@ -13,6 +13,7 @@ Returned by every `extract_keywords()` call on an extractor class.
 | `phrases` | `list[Phrase]` | List of extracted phrases, sorted by score in descending order. |
 | `converged` | `bool` | Whether the PageRank iteration converged within `max_iterations`. |
 | `iterations` | `int` | Number of PageRank iterations actually run. |
+| `consensus` | `ConsensusPayload \| None` | AutoRank-only metadata about the executed variant pool and per-phrase agreement. |
 
 ### Methods
 
@@ -85,6 +86,33 @@ phrase = result.phrases[0]
 repr(phrase)  # "Phrase(text='machine learning', score=0.2341, rank=1)"
 str(phrase)   # "machine learning"
 ```
+
+## ConsensusPayload
+
+Present only for `AutoRank` results.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `selected_variants` | `list[str]` | Canonical names of the executed member variants. |
+| `selection_reason` | `str` | Human-readable summary of why the pool included focus-driven, semantic-driven, or pre-tokenized members. |
+| `variant_runs` | `list[VariantRun]` | Per-variant convergence summaries. |
+| `phrase_support` | `list[PhraseSupport]` | Per-phrase agreement metadata aligned with `TextRankResult.phrases`. |
+
+## VariantRun
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `variant` | `str` | Canonical variant name. |
+| `converged` | `bool` | Whether that member extractor converged. |
+| `iterations` | `int` | Iterations used by that member extractor. |
+
+## PhraseSupport
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `confidence` | `float` | Agreement score in `[0, 1]`, based on the supporting variant weights. |
+| `support_count` | `int` | Number of member variants that supported the phrase. |
+| `supporting_variants` | `list[str]` | Canonical names of the supporting variants. |
 
 ## JSON Result Format
 

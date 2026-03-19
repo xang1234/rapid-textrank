@@ -7,6 +7,7 @@
 //! - SingleRank: TextRank with forced weighted edges and cross-sentence windowing
 //! - TopicalPageRank: SingleRank graph + topic-weight-biased personalized PageRank
 
+pub mod auto_rank;
 pub mod biased_textrank;
 pub mod multipartite_rank;
 pub mod position_rank;
@@ -23,6 +24,7 @@ pub enum Variant {
     SingleRank,
     TopicalPageRank,
     MultipartiteRank,
+    AutoRank,
     #[cfg(feature = "sentence-rank")]
     SentenceRank,
 }
@@ -41,9 +43,25 @@ impl Variant {
             "multipartite_rank" | "multipartiterank" | "multipartite" | "mpr" => {
                 Variant::MultipartiteRank
             }
+            "auto_rank" | "autorank" | "auto" => Variant::AutoRank,
             #[cfg(feature = "sentence-rank")]
             "sentence_rank" | "sentencerank" | "sentence" => Variant::SentenceRank,
             _ => Variant::TextRank,
+        }
+    }
+
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Variant::TextRank => "textrank",
+            Variant::PositionRank => "position_rank",
+            Variant::BiasedTextRank => "biased_textrank",
+            Variant::TopicRank => "topic_rank",
+            Variant::SingleRank => "single_rank",
+            Variant::TopicalPageRank => "topical_pagerank",
+            Variant::MultipartiteRank => "multipartite_rank",
+            Variant::AutoRank => "auto_rank",
+            #[cfg(feature = "sentence-rank")]
+            Variant::SentenceRank => "sentence_rank",
         }
     }
 }

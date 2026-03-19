@@ -11,6 +11,9 @@ use crate::pipeline::observer::NoopObserver;
 #[cfg(feature = "sentence-rank")]
 use crate::pipeline::runner::SentenceRankPipeline;
 use crate::types::{Phrase, PhraseGrouping, ScoreAggregation, TextRankConfig};
+use crate::variants::auto_rank::{
+    AutoRank, AutoRankConsensus, AutoRankPhraseSupport, AutoRankVariantRun,
+};
 use crate::variants::biased_textrank::BiasedTextRank;
 use crate::variants::multipartite_rank::MultipartiteRank;
 use crate::variants::position_rank::PositionRank;
@@ -421,6 +424,147 @@ fn convert_debug_payload(payload: DebugPayload) -> PyDebugPayload {
     }
 }
 
+/// Per-variant convergence metadata for AutoRank.
+#[pyclass(name = "VariantRun")]
+#[derive(Clone)]
+pub struct PyVariantRun {
+    #[pyo3(get)]
+    pub variant: String,
+    #[pyo3(get)]
+    pub converged: bool,
+    #[pyo3(get)]
+    pub iterations: usize,
+}
+
+#[pymethods]
+impl PyVariantRun {
+    fn __repr__(&self) -> String {
+        format!(
+            "VariantRun(variant='{}', converged={}, iterations={})",
+            self.variant, self.converged, self.iterations
+        )
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("variant", &self.variant)?;
+        d.set_item("converged", self.converged)?;
+        d.set_item("iterations", self.iterations)?;
+        Ok(d)
+    }
+}
+
+/// Per-phrase consensus metadata for AutoRank.
+#[pyclass(name = "PhraseSupport")]
+#[derive(Clone)]
+pub struct PyPhraseSupport {
+    #[pyo3(get)]
+    pub confidence: f64,
+    #[pyo3(get)]
+    pub support_count: usize,
+    #[pyo3(get)]
+    pub supporting_variants: Vec<String>,
+}
+
+#[pymethods]
+impl PyPhraseSupport {
+    fn __repr__(&self) -> String {
+        format!(
+            "PhraseSupport(confidence={:.3}, support_count={})",
+            self.confidence, self.support_count
+        )
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("confidence", self.confidence)?;
+        d.set_item("support_count", self.support_count)?;
+        d.set_item("supporting_variants", self.supporting_variants.clone())?;
+        Ok(d)
+    }
+}
+
+/// Consensus payload returned by AutoRank.
+#[pyclass(name = "ConsensusPayload")]
+#[derive(Clone)]
+pub struct PyConsensusPayload {
+    #[pyo3(get)]
+    pub selected_variants: Vec<String>,
+    #[pyo3(get)]
+    pub selection_reason: String,
+    #[pyo3(get)]
+    pub variant_runs: Vec<PyVariantRun>,
+    #[pyo3(get)]
+    pub phrase_support: Vec<PyPhraseSupport>,
+}
+
+#[pymethods]
+impl PyConsensusPayload {
+    fn __repr__(&self) -> String {
+        format!(
+            "ConsensusPayload(selected_variants={}, phrases={})",
+            self.selected_variants.len(),
+            self.phrase_support.len()
+        )
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("selected_variants", self.selected_variants.clone())?;
+        d.set_item("selection_reason", &self.selection_reason)?;
+        let variant_runs: Vec<_> = self
+            .variant_runs
+            .iter()
+            .map(|run| run.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("variant_runs", variant_runs)?;
+        let phrase_support: Vec<_> = self
+            .phrase_support
+            .iter()
+            .map(|support| support.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("phrase_support", phrase_support)?;
+        Ok(d)
+    }
+}
+
+fn convert_consensus(payload: AutoRankConsensus) -> PyConsensusPayload {
+    PyConsensusPayload {
+        selected_variants: payload.selected_variants,
+        selection_reason: payload.selection_reason,
+        variant_runs: payload
+            .variant_runs
+            .into_iter()
+            .map(
+                |AutoRankVariantRun {
+                     variant,
+                     converged,
+                     iterations,
+                 }| PyVariantRun {
+                    variant,
+                    converged,
+                    iterations,
+                },
+            )
+            .collect(),
+        phrase_support: payload
+            .phrase_support
+            .into_iter()
+            .map(
+                |AutoRankPhraseSupport {
+                     confidence,
+                     support_count,
+                     supporting_variants,
+                 }| PyPhraseSupport {
+                    confidence,
+                    support_count,
+                    supporting_variants,
+                },
+            )
+            .collect(),
+    }
+}
+
 /// Convert an `ExtractionResult` into a `PyTextRankResult`.
 fn extraction_result_to_py(
     result: crate::phrase::extraction::ExtractionResult,
@@ -430,6 +574,7 @@ fn extraction_result_to_py(
         converged: result.converged,
         iterations: result.iterations,
         debug: result.debug.map(convert_debug_payload),
+        consensus: result.consensus.map(convert_consensus),
     }
 }
 
@@ -447,16 +592,19 @@ pub struct PyTextRankResult {
     pub iterations: usize,
     #[pyo3(get)]
     pub debug: Option<PyDebugPayload>,
+    #[pyo3(get)]
+    pub consensus: Option<PyConsensusPayload>,
 }
 
 #[pymethods]
 impl PyTextRankResult {
     fn __repr__(&self) -> String {
         format!(
-            "TextRankResult(phrases={}, converged={}, iterations={})",
+            "TextRankResult(phrases={}, converged={}, iterations={}, consensus={})",
             self.phrases.len(),
             self.converged,
-            self.iterations
+            self.iterations,
+            self.consensus.is_some()
         )
     }
 
@@ -1111,6 +1259,121 @@ impl PyTopicalPageRank {
     }
 }
 
+/// AutoRank ensemble keyword extractor.
+#[pyclass(name = "AutoRank")]
+pub struct PyAutoRank {
+    config: TextRankConfig,
+    focus_terms: Vec<String>,
+    bias_weight: f64,
+    semantic_weights: HashMap<String, f64>,
+    semantic_min_weight: f64,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
+}
+
+#[pymethods]
+impl PyAutoRank {
+    #[new]
+    #[pyo3(signature = (focus_terms=None, bias_weight=5.0, semantic_weights=None, semantic_min_weight=0.0, config=None, top_n=None, language=None, max_threads=None))]
+    fn new(
+        focus_terms: Option<Vec<String>>,
+        bias_weight: f64,
+        semantic_weights: Option<HashMap<String, f64>>,
+        semantic_min_weight: f64,
+        config: Option<PyTextRankConfig>,
+        top_n: Option<usize>,
+        language: Option<&str>,
+        max_threads: Option<usize>,
+    ) -> PyResult<Self> {
+        let mut inner_config = config.map(|c| c.inner).unwrap_or_default();
+
+        if let Some(n) = top_n {
+            inner_config.top_n = n;
+        }
+        if let Some(lang) = language {
+            inner_config.language = lang.to_string();
+        }
+
+        Ok(Self {
+            config: inner_config,
+            focus_terms: focus_terms.unwrap_or_default(),
+            bias_weight,
+            semantic_weights: semantic_weights.unwrap_or_default(),
+            semantic_min_weight,
+            thread_pool: build_thread_pool(max_threads)?,
+        })
+    }
+
+    fn set_focus(&mut self, focus_terms: Vec<String>) {
+        self.focus_terms = focus_terms;
+    }
+
+    fn set_semantic_weights(&mut self, semantic_weights: HashMap<String, f64>) {
+        self.semantic_weights = semantic_weights;
+    }
+
+    #[pyo3(signature = (text))]
+    fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let config = self.config.clone();
+        let focus_terms = self.focus_terms.clone();
+        let bias_weight = self.bias_weight;
+        let semantic_weights = self.semantic_weights.clone();
+        let semantic_min_weight = self.semantic_min_weight;
+        let text = text.to_owned();
+        let pool = self.thread_pool.clone();
+
+        let result = py.allow_threads(move || {
+            run_in_pool(&pool, move || {
+                let tokenizer = Tokenizer::new();
+                let (_, mut tokens) = tokenizer.tokenize(&text);
+
+                let stopwords = if config.stopwords.is_empty() {
+                    StopwordFilter::new(&config.language)
+                } else {
+                    StopwordFilter::with_additional(&config.language, &config.stopwords)
+                };
+                for token in &mut tokens {
+                    token.is_stopword = stopwords.is_stopword(&token.text);
+                }
+
+                AutoRank::with_config(config)
+                    .with_topic_rank_enabled(false)
+                    .with_focus(
+                        &focus_terms
+                            .iter()
+                            .map(|term| term.as_str())
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_bias_weight(bias_weight)
+                    .with_semantic_weights(semantic_weights)
+                    .with_semantic_min_weight(semantic_min_weight)
+                    .extract_with_info(&tokens)
+            })
+        });
+
+        Ok(extraction_result_to_py(result))
+    }
+
+    #[getter]
+    fn max_threads(&self) -> Option<usize> {
+        self.thread_pool.as_ref().map(|p| p.current_num_threads())
+    }
+
+    #[pyo3(signature = (max_threads=None))]
+    fn set_max_threads(&mut self, max_threads: Option<usize>) -> PyResult<()> {
+        self.thread_pool = build_thread_pool(max_threads)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AutoRank(focus_terms={}, semantic_weights={}, top_n={})",
+            self.focus_terms.len(),
+            self.semantic_weights.len(),
+            self.config.top_n
+        )
+    }
+}
+
 /// MultipartiteRank keyword extractor
 ///
 /// Builds a k-partite directed graph where candidates from different
@@ -1283,6 +1546,7 @@ impl PySentenceRank {
             converged: result.converged,
             iterations: result.iterations as usize,
             debug: result.debug.map(convert_debug_payload),
+            consensus: None,
         })
     }
 

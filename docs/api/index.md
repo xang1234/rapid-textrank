@@ -2,18 +2,18 @@
 
 rapid_textrank provides three API layers, each suited to different use cases. Pick the one that matches your workflow.
 
-## 1. Convenience Function
+## 1. Convenience Functions
 
-The [`extract_keywords()`](extract-keywords.md) function is the simplest way to extract keywords. One import, one call, results as a list of `Phrase` objects. Ideal for quick scripts and prototyping.
+The convenience functions in [`extract-keywords()`](extract-keywords.md) are the simplest way to extract keywords. `extract_keywords()` keeps the stable BaseTextRank one-liner, while `extract_keywords_auto()` gives you the AutoRank ensemble in one call.
 
 ```python
-from rapid_textrank import extract_keywords
-phrases = extract_keywords("Your text here.", top_n=10, language="en")
+from rapid_textrank import extract_keywords_auto
+phrases = extract_keywords_auto("Your text here.", top_n=10, language="en")
 ```
 
 ## 2. Extractor Classes
 
-The [extractor classes](extractor-classes.md) give you more control over the algorithm variant and configuration. Create a reusable instance with a [`TextRankConfig`](textrank-config.md), then call `extract_keywords()` on any number of documents. Six classes are available as native Python objects: BaseTextRank, PositionRank, BiasedTextRank, SingleRank, TopicalPageRank, and MultipartiteRank.
+The [extractor classes](extractor-classes.md) give you more control over the algorithm variant and configuration. Create a reusable instance with a [`TextRankConfig`](textrank-config.md), then call `extract_keywords()` on any number of documents. Native Python objects are available for BaseTextRank, PositionRank, BiasedTextRank, SingleRank, TopicalPageRank, AutoRank, MultipartiteRank, and SentenceRank.
 
 ```python
 from rapid_textrank import PositionRank

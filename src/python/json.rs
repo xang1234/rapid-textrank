@@ -19,6 +19,7 @@ use crate::pipeline::validation::{ValidationDiagnostic, ValidationEngine, Valida
 use crate::types::{
     DeterminismMode, PhraseGrouping, PosTag, ScoreAggregation, TextRankConfig, Token,
 };
+use crate::variants::auto_rank::AutoRank;
 use crate::variants::biased_textrank::BiasedTextRank;
 use crate::variants::multipartite_rank::MultipartiteRank;
 use crate::variants::position_rank::PositionRank;
@@ -169,9 +170,15 @@ pub struct JsonConfig {
     /// Topic weights for Topical PageRank: {"lemma": weight, ...}
     #[serde(default)]
     pub topic_weights: HashMap<String, f64>,
+    /// Semantic weights for AutoRank: {"lemma": weight, ...}
+    #[serde(default)]
+    pub semantic_weights: HashMap<String, f64>,
     /// Minimum weight for OOV words in Topical PageRank (default 0.0)
     #[serde(default)]
     pub topic_min_weight: f64,
+    /// Minimum weight for OOV words in AutoRank semantic priors (default 0.0)
+    #[serde(default)]
+    pub semantic_min_weight: f64,
     /// Alpha weight adjustment for MultipartiteRank (default 1.1)
     #[serde(default = "default_multipartite_alpha")]
     pub multipartite_alpha: f64,
@@ -260,7 +267,9 @@ impl Default for JsonConfig {
             topic_similarity_threshold: default_topic_similarity_threshold(),
             topic_edge_weight: default_topic_edge_weight(),
             topic_weights: HashMap::new(),
+            semantic_weights: HashMap::new(),
             topic_min_weight: 0.0,
+            semantic_min_weight: 0.0,
             multipartite_alpha: default_multipartite_alpha(),
             multipartite_similarity_threshold: default_multipartite_similarity_threshold(),
             determinism: String::new(),
@@ -353,6 +362,30 @@ fn extract_with_variant(
             .with_similarity_threshold(json_config.multipartite_similarity_threshold)
             .with_alpha(json_config.multipartite_alpha)
             .extract_with_info(tokens),
+        Variant::AutoRank => {
+            let semantic_weights = if json_config.semantic_weights.is_empty() {
+                json_config.topic_weights.clone()
+            } else {
+                json_config.semantic_weights.clone()
+            };
+            let semantic_min_weight = if json_config.semantic_weights.is_empty() {
+                json_config.topic_min_weight
+            } else {
+                json_config.semantic_min_weight
+            };
+            AutoRank::with_config(config.clone())
+                .with_focus(
+                    &json_config
+                        .focus_terms
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .with_bias_weight(json_config.bias_weight)
+                .with_semantic_weights(semantic_weights)
+                .with_semantic_min_weight(semantic_min_weight)
+                .extract_with_info(tokens)
+        }
         #[cfg(feature = "sentence-rank")]
         Variant::SentenceRank => {
             let stream = TokenStream::from_tokens(tokens);
@@ -363,6 +396,7 @@ fn extract_with_variant(
                 converged: formatted.converged,
                 iterations: formatted.iterations as usize,
                 debug: formatted.debug,
+                consensus: None,
             }
         }
     }
@@ -386,6 +420,8 @@ pub struct JsonResult {
     pub iterations: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<crate::pipeline::artifacts::DebugPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<crate::variants::auto_rank::AutoRankConsensus>,
 }
 
 /// JSON response for validation-only requests.
@@ -672,6 +708,7 @@ fn extraction_to_json_result(result: crate::phrase::extraction::ExtractionResult
         converged: result.converged,
         iterations: result.iterations,
         debug: result.debug,
+        consensus: result.consensus,
     }
 }
 
@@ -692,6 +729,7 @@ fn formatted_to_json_result(result: crate::pipeline::artifacts::FormattedResult)
         converged: result.converged,
         iterations: result.iterations as usize,
         debug: result.debug,
+        consensus: None,
     }
 }
 
@@ -2800,6 +2838,60 @@ mod tests {
         assert_eq!(result_a, result_b);
     }
 
+    #[test]
+    fn test_auto_rank_variant_dispatch_includes_consensus() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "variant": "auto_rank",
+                "config": {{
+                    "top_n": 5,
+                    "determinism": "deterministic",
+                    "semantic_weights": {{"machine": 1.0, "learning": 0.8}}
+                }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let result =
+            process_single_doc(serde_json::from_str::<JsonDocument>(&json_input).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("phrases").is_some());
+        assert!(parsed.get("consensus").is_some());
+        let selected = parsed["consensus"]["selected_variants"].as_array().unwrap();
+        assert!(
+            selected.iter().any(|v| v == "topic_rank"),
+            "pre-tokenized AutoRank should include TopicRank"
+        );
+        assert!(
+            selected.iter().any(|v| v == "topical_pagerank"),
+            "semantic weights should enable TopicalPageRank"
+        );
+    }
+
+    #[test]
+    fn test_auto_rank_topic_weight_alias_enables_semantic_hook() {
+        let json_input = format!(
+            r#"{{
+                "tokens": {},
+                "variant": "auto_rank",
+                "config": {{
+                    "top_n": 5,
+                    "topic_weights": {{"machine": 0.9, "learning": 0.7}},
+                    "topic_min_weight": 0.1
+                }}
+            }}"#,
+            pipeline_test_tokens_json()
+        );
+        let result =
+            process_single_doc(serde_json::from_str::<JsonDocument>(&json_input).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let selected = parsed["consensus"]["selected_variants"].as_array().unwrap();
+        assert!(
+            selected.iter().any(|v| v == "topical_pagerank"),
+            "topic_weights should act as the AutoRank semantic alias"
+        );
+    }
+
     // ─── SentenceRank variant dispatch ──────────────────────────────
 
     #[cfg(feature = "sentence-rank")]
@@ -3028,6 +3120,7 @@ mod tests {
             converged: true,
             iterations: 1,
             debug: None,
+            consensus: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("debug").is_none());
@@ -3041,6 +3134,7 @@ mod tests {
             converged: true,
             iterations: 1,
             debug: Some(DebugPayload::default()),
+            consensus: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("debug").is_some());

@@ -6,7 +6,7 @@
 
 **High-performance TextRank keyword extraction in Rust with Python bindings.**
 
-Extract keywords and key phrases from text up to 10-100x faster than pure Python implementations, with 7 algorithm variants and stopword support for 18 languages. Computation runs in Rust; the Python GIL is released during extraction.
+Extract keywords and key phrases from text up to 10-100x faster than pure Python implementations, with 7 core algorithm variants, an `AutoRank` ensemble, and stopword support for 18 languages. Computation runs in Rust; the Python GIL is released during extraction.
 
 ## Install
 
@@ -40,6 +40,23 @@ deep learning: 0.1872
 artificial intelligence: 0.1654
 neural networks: 0.1432
 systems: 0.0891
+```
+
+## Recommended Default: AutoRank
+
+If you do not want to choose a variant manually, use `AutoRank`. It runs the full eligible keyword ensemble for the document and returns consensus metadata alongside the ranked phrases.
+
+```python
+from rapid_textrank import AutoRank
+
+extractor = AutoRank(top_n=5, language="en")
+result = extractor.extract_keywords(text)
+
+for phrase, support in zip(result.phrases, result.consensus.phrase_support):
+    print(
+        f"{phrase.text}: {phrase.score:.4f} "
+        f"(confidence={support.confidence:.2f}, variants={support.supporting_variants})"
+    )
 ```
 
 ## Performance
@@ -88,6 +105,8 @@ result = extractor.extract_keywords(text, focus_terms=["privacy", "retention", "
 ```
 
 ## Choosing an Algorithm
+
+Use `AutoRank` when you want the library to pick and fuse the right keyword variants for you. Use the table below when you want to select a specific algorithm yourself.
 
 | Algorithm | Best for | Key idea |
 |---|---|---|

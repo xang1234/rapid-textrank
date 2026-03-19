@@ -97,6 +97,7 @@ impl TopicRank {
                 converged: true,
                 iterations: 0,
                 debug: None,
+                consensus: None,
             };
         }
 
@@ -109,6 +110,7 @@ impl TopicRank {
                 converged: true,
                 iterations: 0,
                 debug: None,
+                consensus: None,
             };
         }
 
@@ -178,6 +180,7 @@ impl TopicRank {
             converged: pagerank.converged,
             iterations: pagerank.iterations,
             debug,
+            consensus: None,
         }
     }
 

@@ -93,6 +93,7 @@ impl MultipartiteRank {
                 converged: true,
                 iterations: 0,
                 debug: None,
+                consensus: None,
             };
         }
 
@@ -104,6 +105,7 @@ impl MultipartiteRank {
                 converged: true,
                 iterations: 0,
                 debug: None,
+                consensus: None,
             };
         }
 
@@ -251,6 +253,7 @@ impl MultipartiteRank {
             converged: pagerank.converged,
             iterations: pagerank.iterations,
             debug,
+            consensus: None,
         }
     }
 

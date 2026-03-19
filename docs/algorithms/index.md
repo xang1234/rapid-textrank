@@ -1,8 +1,8 @@
 # Algorithm Variants
 
-rapid_textrank ships with seven algorithm variants, each tailored to a different extraction scenario. All variants share the same core pipeline -- build a word co-occurrence graph, run PageRank (or a personalized variant), and extract scored phrases -- but they differ in how they construct the graph, weight edges, and post-process results.
+rapid_textrank ships with seven core algorithm variants plus `AutoRank`, a smart ensemble that fuses the full eligible keyword pool for a document. The core variants all share the same graph-and-PageRank foundation, but they differ in how they construct the graph, weight edges, and post-process results.
 
-Choose the variant that best matches your document type and extraction goal. If you are unsure where to start, see [Choosing a Variant](choosing-a-variant.md).
+Choose the variant that best matches your document type and extraction goal. If you are unsure where to start, use `AutoRank` or see [Choosing a Variant](choosing-a-variant.md).
 
 ## Variant Comparison
 
@@ -20,6 +20,7 @@ Choose the variant that best matches your document type and extraction goal. If 
 
 - [How TextRank Works](how-textrank-works.md) -- the three-step pipeline shared by all variants.
 - [Choosing a Variant](choosing-a-variant.md) -- a decision flowchart and scenario table to help you pick the right one.
+- `AutoRank` -- the recommended keyword default when you do not want to choose a single variant manually.
 
 !!! tip "Interactive Notebook"
     Compare all variants side-by-side in the [Algorithm Variants Notebook](https://github.com/xang1234/rapid-textrank/blob/main/notebooks/02_algorithm_variants.ipynb).

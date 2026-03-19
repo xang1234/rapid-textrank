@@ -3004,6 +3004,7 @@ mod tests {
             converged: false,
             iterations: 100,
             debug: None,
+            consensus: None,
         };
         let fr = FormattedResult::from_extraction(&er);
 

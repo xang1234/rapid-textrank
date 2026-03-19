@@ -97,6 +97,7 @@ Each token in the `tokens` array:
 | SingleRank | `"single_rank"`, `"singlerank"`, `"single"` |
 | TopicalPageRank | `"topical_pagerank"`, `"topicalpagerank"`, `"tpr"`, `"single_tpr"` |
 | MultipartiteRank | `"multipartite_rank"`, `"multipartiterank"`, `"multipartite"`, `"mpr"` |
+| AutoRank | `"auto_rank"`, `"autorank"`, `"auto"` |
 
 ## Variant-Specific Config Fields
 
@@ -129,6 +130,17 @@ In addition to the standard [TextRankConfig](textrank-config.md) fields, each va
 |-------|------|---------|-------------|
 | `multipartite_alpha` | `float` | `1.1` | Position boost strength. Set to `0` to disable. |
 | `multipartite_similarity_threshold` | `float` | `0.26` | Jaccard threshold for topic clustering. |
+
+### auto_rank
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `focus_terms` | `list[str]` | `[]` | Optional focus vocabulary enabling BiasedTextRank inside AutoRank. |
+| `bias_weight` | `float` | `5.0` | Bias strength for the focus-driven member extractor. |
+| `semantic_weights` | `dict[str, float]` | `{}` | Optional lemma weights enabling semantic priors and TopicalPageRank inside AutoRank. |
+| `semantic_min_weight` | `float` | `0.0` | Fallback weight for missing lemmas in the AutoRank semantic prior. |
+| `topic_weights` | `dict[str, float]` | `{}` | Backward-compatible alias for `semantic_weights` when `variant="auto_rank"`. |
+| `topic_min_weight` | `float` | `0.0` | Backward-compatible alias for `semantic_min_weight` when `variant="auto_rank"`. |
 
 ## Single Document Example
 
@@ -255,6 +267,15 @@ for phrase in result["phrases"]:
 ```
 
 ## Stopword Handling
+
+## AutoRank Result Metadata
+
+When `variant="auto_rank"`, the JSON result includes a `consensus` object with:
+
+- `selected_variants`
+- `selection_reason`
+- `variant_runs`
+- `phrase_support`
 
 The JSON interface supports two complementary mechanisms for stopword filtering:
 

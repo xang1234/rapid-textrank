@@ -1,8 +1,11 @@
-# extract_keywords()
+# Convenience Functions
 
-The convenience function for one-liner keyword extraction. It uses `BaseTextRank` internally and returns a flat list of `Phrase` objects.
+rapid_textrank ships two one-liner keyword helpers:
 
-## Signature
+- `extract_keywords()` -- stable BaseTextRank default
+- `extract_keywords_auto()` -- AutoRank ensemble default
+
+## extract_keywords()
 
 ```python
 extract_keywords(text: str, top_n: int = 10, language: str = "en") -> list[Phrase]
@@ -55,3 +58,15 @@ systems: 0.0891
 - You are processing a single document and do not need to reuse an extractor instance.
 
 For more control over the algorithm (damping factor, window size, POS filtering, phrase grouping, etc.), use the [extractor classes](extractor-classes.md) with a [`TextRankConfig`](textrank-config.md).
+
+## extract_keywords_auto()
+
+Use `extract_keywords_auto()` when you want the library to run and fuse the full eligible keyword pool for the document.
+
+```python
+from rapid_textrank import extract_keywords_auto
+
+phrases = extract_keywords_auto("Machine learning powers modern search.", top_n=5)
+```
+
+It returns the same flat `list[Phrase]` shape as `extract_keywords()`. Use the `AutoRank` class directly when you want access to consensus metadata.

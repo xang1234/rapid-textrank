@@ -17,9 +17,9 @@ This page compares rapid_textrank with other popular keyword and keyphrase extra
 
 ### rapid_textrank
 
-Best for **speed-critical pipelines, batch processing, and multi-variant exploration**.
+Best for **speed-critical pipelines, batch processing, multi-variant exploration, and a smart default ensemble**.
 
-Choose rapid_textrank when latency matters -- real-time APIs, high-throughput batch jobs, or interactive applications where users expect instant results. The seven algorithm variants (BaseTextRank, PositionRank, BiasedTextRank, TopicRank, SingleRank, TopicalPageRank, MultipartiteRank) let you experiment with different ranking strategies without switching libraries. The JSON API is ideal for pipelines that already tokenize with spaCy or another NLP tool.
+Choose rapid_textrank when latency matters -- real-time APIs, high-throughput batch jobs, or interactive applications where users expect instant results. The seven core algorithm variants (BaseTextRank, PositionRank, BiasedTextRank, TopicRank, SingleRank, TopicalPageRank, MultipartiteRank) let you experiment with different ranking strategies without switching libraries, and `AutoRank` gives you a high-quality default when you do not want to choose manually. The JSON API is ideal for pipelines that already tokenize with spaCy or another NLP tool.
 
 ### pytextrank
 
@@ -53,4 +53,4 @@ Rake-NLTK implements the Rapid Automatic Keyword Extraction (RAKE) algorithm, wh
 
 ## Summary
 
-If speed is your primary concern and you want flexibility across algorithm variants, rapid_textrank is the strongest choice. If you need semantic understanding, look at KeyBERT. If you need minimal dependencies and a simple statistical approach, consider YAKE or Rake-NLTK. If you are building on spaCy, pytextrank or pke integrate naturally into that ecosystem.
+If speed is your primary concern and you want flexibility across algorithm variants, rapid_textrank is the strongest choice. If you want the library to make the variant choice for you, use `AutoRank`. If you need deeper semantic understanding than graph methods can provide on their own, look at KeyBERT. If you need minimal dependencies and a simple statistical approach, consider YAKE or Rake-NLTK. If you are building on spaCy, pytextrank or pke integrate naturally into that ecosystem.

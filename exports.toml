@@ -12,11 +12,15 @@
 Phrase = {}
 TextRankResult = {}
 TextRankConfig = {}
+ConsensusPayload = {}
+VariantRun = {}
+PhraseSupport = {}
 BaseTextRank = {}
 PositionRank = {}
 BiasedTextRank = {}
 SingleRank = {}
 TopicalPageRank = {}
+AutoRank = {}
 MultipartiteRank = {}
 SentenceRank = { feature = "sentence-rank" }
 BatchIter = {}

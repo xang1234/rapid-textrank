@@ -10,11 +10,15 @@ from rapid_textrank._rust import (
     Phrase,
     TextRankResult,
     TextRankConfig,
+    ConsensusPayload,
+    VariantRun,
+    PhraseSupport,
     BaseTextRank,
     PositionRank,
     BiasedTextRank,
     SingleRank,
     TopicalPageRank,
+    AutoRank,
     MultipartiteRank,
     SentenceRank,
     extract_from_json,
@@ -38,17 +42,22 @@ __all__ = [
     "Phrase",
     "TextRankResult",
     "TextRankConfig",
+    "ConsensusPayload",
+    "VariantRun",
+    "PhraseSupport",
     "BaseTextRank",
     "PositionRank",
     "BiasedTextRank",
     "SingleRank",
     "TopicalPageRank",
+    "AutoRank",
     "MultipartiteRank",
     "SentenceRank",
     "extract_from_json",
     "extract_batch_from_json",
     "extract_batch_iter",
     "extract_jsonl_from_json",
+    "extract_keywords_auto",
     "BatchIter",
     "validate_pipeline_spec",
     "get_stopwords",
@@ -93,5 +102,22 @@ def extract_keywords(text: str, top_n: int = 10, language: str = "en") -> list:
         ...     print(f"{phrase.text}: {phrase.score:.4f}")
     """
     extractor = BaseTextRank(top_n=top_n, language=language)
+    result = extractor.extract_keywords(text)
+    return list(result.phrases)
+
+
+def extract_keywords_auto(text: str, top_n: int = 10, language: str = "en") -> list:
+    """
+    Extract keywords from text using AutoRank.
+
+    Args:
+        text: The input text to extract keywords from
+        top_n: Number of top keywords to return
+        language: Language code for stopword filtering
+
+    Returns:
+        List of Phrase objects with text, score, and rank
+    """
+    extractor = AutoRank(top_n=top_n, language=language)
     result = extractor.extract_keywords(text)
     return list(result.phrases)

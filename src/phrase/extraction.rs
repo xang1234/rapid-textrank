@@ -335,6 +335,8 @@ pub struct ExtractionResult {
     pub iterations: usize,
     /// Optional debug/inspect payload (populated when `debug_level > None`).
     pub debug: Option<crate::pipeline::artifacts::DebugPayload>,
+    /// Optional AutoRank consensus payload.
+    pub consensus: Option<crate::variants::auto_rank::AutoRankConsensus>,
 }
 
 /// Manual `PartialEq` that ignores `debug` — the payload contains `f64` fields
@@ -344,6 +346,7 @@ impl PartialEq for ExtractionResult {
         self.phrases == other.phrases
             && self.converged == other.converged
             && self.iterations == other.iterations
+            && self.consensus == other.consensus
     }
 }
 
@@ -391,6 +394,7 @@ pub fn extract_keyphrases_with_info(tokens: &[Token], config: &TextRankConfig) -
             converged: true,
             iterations: 0,
             debug: None,
+            consensus: None,
         };
     }
 
@@ -432,6 +436,7 @@ pub fn extract_keyphrases_with_info(tokens: &[Token], config: &TextRankConfig) -
         converged,
         iterations,
         debug,
+        consensus: None,
     }
 }
 

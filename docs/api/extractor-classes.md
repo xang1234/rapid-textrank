@@ -1,6 +1,6 @@
 # Extractor Classes
 
-The class-based API gives you reusable extractor instances with full configuration control. Six classes are available as native Python objects. TopicRank is available only through the [JSON interface](json-interface.md).
+The class-based API gives you reusable extractor instances with full configuration control. AutoRank is the recommended default when you do not want to choose a single algorithm manually. TopicRank is available only through the [JSON interface](json-interface.md).
 
 ## Class Summary
 
@@ -11,6 +11,7 @@ The class-based API gives you reusable extractor instances with full configurati
 | `BiasedTextRank` | `focus_terms`, `bias_weight=5.0` | `set_focus(terms)`, `extract_keywords(text, focus_terms=None)` |
 | `SingleRank` | -- | `extract_keywords(text)` |
 | `TopicalPageRank` | `topic_weights`, `min_weight=0.0` | `set_topic_weights(w)`, `extract_keywords(text, topic_weights=None)` |
+| `AutoRank` | `focus_terms`, `bias_weight=5.0`, `semantic_weights`, `semantic_min_weight=0.0` | `set_focus(terms)`, `set_semantic_weights(w)`, `extract_keywords(text)` |
 | `MultipartiteRank` | `similarity_threshold=0.26`, `alpha=1.1` | `extract_keywords(text)` |
 
 All classes share these constructor parameters:
@@ -184,6 +185,39 @@ result = extractor.extract_keywords(text, topic_weights={"machine": 0.9, "data":
 ```
 
 See [Topic Utilities](topic-utilities.md) for computing topic weights from LDA.
+
+## AutoRank
+
+Runs the full eligible keyword ensemble for the document and fuses the results into one ranked list. Use it when you want a strong default without manual variant selection.
+
+### Constructor
+
+```python
+AutoRank(
+    focus_terms=None,
+    bias_weight=5.0,
+    semantic_weights=None,
+    semantic_min_weight=0.0,
+    config=None,
+    top_n=None,
+    language=None,
+)
+```
+
+### Usage
+
+```python
+from rapid_textrank import AutoRank
+
+extractor = AutoRank(
+    top_n=10,
+    semantic_weights={"machine": 1.0, "learning": 0.8},
+)
+result = extractor.extract_keywords(text)
+
+for phrase, support in zip(result.phrases, result.consensus.phrase_support):
+    print(phrase.text, support.confidence, support.supporting_variants)
+```
 
 ## MultipartiteRank
 

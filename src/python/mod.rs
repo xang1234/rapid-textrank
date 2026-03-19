@@ -16,6 +16,9 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<native::PyPhrase>()?;
     m.add_class::<native::PyTextRankResult>()?;
     m.add_class::<native::PyTextRankConfig>()?;
+    m.add_class::<native::PyConsensusPayload>()?;
+    m.add_class::<native::PyVariantRun>()?;
+    m.add_class::<native::PyPhraseSupport>()?;
 
     // Debug / inspect classes
     m.add_class::<native::PyDebugPayload>()?;
@@ -30,6 +33,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<native::PyBiasedTextRank>()?;
     m.add_class::<native::PySingleRank>()?;
     m.add_class::<native::PyTopicalPageRank>()?;
+    m.add_class::<native::PyAutoRank>()?;
     m.add_class::<native::PyMultipartiteRank>()?;
     #[cfg(feature = "sentence-rank")]
     m.add_class::<native::PySentenceRank>()?;

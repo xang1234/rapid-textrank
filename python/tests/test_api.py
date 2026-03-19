@@ -15,6 +15,7 @@ def test_import():
     assert hasattr(rapid_textrank, "PositionRank")
     assert hasattr(rapid_textrank, "BiasedTextRank")
     assert hasattr(rapid_textrank, "SingleRank")
+    assert hasattr(rapid_textrank, "AutoRank")
 
 
 def _find_exports_toml():
@@ -301,6 +302,77 @@ class TestSingleRankJson:
         assert len(result["phrases"]) > 0
 
 
+class TestAutoRank:
+    """Tests for AutoRank extractor."""
+
+    def test_extract_keywords_basic(self):
+        """AutoRank returns phrases plus consensus metadata."""
+        from rapid_textrank import AutoRank
+
+        extractor = AutoRank(top_n=5)
+        result = extractor.extract_keywords(
+            "Machine learning is a subset of artificial intelligence. "
+            "Deep learning is a type of machine learning. "
+            "Topic models improve keyword extraction."
+        )
+
+        assert len(result.phrases) > 0
+        assert result.consensus is not None
+        assert len(result.consensus.selected_variants) >= 4
+        assert len(result.consensus.phrase_support) == len(result.phrases)
+
+    def test_focus_and_semantic_weights_enable_specialized_members(self):
+        """Focus and semantic weights expand the executed pool."""
+        from rapid_textrank import AutoRank
+
+        extractor = AutoRank(
+            top_n=5,
+            focus_terms=["privacy"],
+            semantic_weights={"privacy": 1.0, "retention": 0.8},
+        )
+        result = extractor.extract_keywords(
+            "Privacy retention policies guide data minimization. "
+            "Retention schedules support privacy reviews."
+        )
+
+        selected = set(result.consensus.selected_variants)
+        assert "biased_textrank" in selected
+        assert "topical_pagerank" in selected
+
+    def test_json_variant_auto_rank(self):
+        """AutoRank works through the JSON interface and serializes consensus."""
+        from rapid_textrank import extract_from_json
+
+        doc = {
+            "tokens": [
+                {"text": "Machine", "lemma": "machine", "pos": "NOUN",
+                 "start": 0, "end": 7, "sentence_idx": 0, "token_idx": 0,
+                 "is_stopword": False},
+                {"text": "learning", "lemma": "learning", "pos": "NOUN",
+                 "start": 8, "end": 16, "sentence_idx": 0, "token_idx": 1,
+                 "is_stopword": False},
+                {"text": "topic", "lemma": "topic", "pos": "NOUN",
+                 "start": 18, "end": 23, "sentence_idx": 1, "token_idx": 2,
+                 "is_stopword": False},
+                {"text": "models", "lemma": "model", "pos": "NOUN",
+                 "start": 24, "end": 30, "sentence_idx": 1, "token_idx": 3,
+                 "is_stopword": False},
+            ],
+            "variant": "auto_rank",
+            "config": {
+                "top_n": 5,
+                "semantic_weights": {"machine": 0.9, "learning": 0.8},
+            },
+        }
+
+        result_json = extract_from_json(json.dumps(doc))
+        result = json.loads(result_json)
+
+        assert "phrases" in result
+        assert "consensus" in result
+        assert "selected_variants" in result["consensus"]
+
+
 class TestTextRankConfig:
     """Tests for TextRankConfig."""
 
@@ -431,6 +503,16 @@ class TestConvenienceFunction:
 
         assert isinstance(phrases, list)
 
+    def test_extract_keywords_auto(self):
+        """Test the AutoRank convenience function."""
+        from rapid_textrank import extract_keywords_auto
+
+        phrases = extract_keywords_auto(
+            "Machine learning is transforming industries.", top_n=5
+        )
+
+        assert isinstance(phrases, list)
+
 
 class TestMaxThreads:
     """Tests for per-extractor thread pool via max_threads."""
@@ -502,6 +584,7 @@ class TestMaxThreads:
             BiasedTextRank,
             SingleRank,
             TopicalPageRank,
+            AutoRank,
             MultipartiteRank,
         )
 
@@ -511,6 +594,7 @@ class TestMaxThreads:
             lambda: BiasedTextRank(top_n=3, max_threads=1),
             lambda: SingleRank(top_n=3, max_threads=1),
             lambda: TopicalPageRank(top_n=3, max_threads=1),
+            lambda: AutoRank(top_n=3, max_threads=1),
             lambda: MultipartiteRank(top_n=3, max_threads=1),
         ]
 

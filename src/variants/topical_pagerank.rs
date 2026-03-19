@@ -92,6 +92,7 @@ impl TopicalPageRank {
                 converged: true,
                 iterations: 0,
                 debug: None,
+                consensus: None,
             };
         }
 
@@ -130,6 +131,7 @@ impl TopicalPageRank {
             converged: pagerank.converged,
             iterations: pagerank.iterations,
             debug,
+            consensus: None,
         }
     }
 
