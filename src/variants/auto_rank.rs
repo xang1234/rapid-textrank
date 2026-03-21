@@ -132,6 +132,7 @@ impl AutoRank {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_topic_rank_enabled(mut self, enabled: bool) -> Self {
         self.include_topic_rank = enabled;
         self
@@ -216,7 +217,7 @@ impl AutoRank {
             })
             .collect();
 
-        ranked.sort_by(|a, b| compare_ranked_candidates(a, b));
+        ranked.sort_by(compare_ranked_candidates);
 
         let limit = if self.config.top_n == 0 {
             ranked.len()
