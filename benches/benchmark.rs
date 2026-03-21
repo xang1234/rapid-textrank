@@ -338,6 +338,7 @@ fn benchmark_pipeline_vs_direct(c: &mut Criterion) {
                     converged: true,
                     iterations: 0,
                     debug: None,
+                    consensus: None,
                 };
             }
             let graph = graph::csr::CsrGraph::from_builder(&builder);
@@ -353,6 +354,7 @@ fn benchmark_pipeline_vs_direct(c: &mut Criterion) {
                 converged: pagerank.converged,
                 iterations: pagerank.iterations,
                 debug: None,
+                consensus: None,
             }
         })
     });
