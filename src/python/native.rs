@@ -3,6 +3,7 @@
 //! Direct Python classes for small documents where Python↔Rust
 //! overhead is negligible compared to processing time.
 
+use crate::cache::{self, ExtractionCache};
 use crate::nlp::stopwords::StopwordFilter;
 use crate::nlp::tokenizer::Tokenizer;
 use crate::phrase::extraction::extract_keyphrases_with_info;
@@ -62,6 +63,60 @@ impl From<Phrase> for PyPhrase {
             score: p.score,
             count: p.count,
             rank: p.rank,
+        }
+    }
+}
+
+// ─── Cache stats ────────────────────────────────────────────────────────
+
+/// Cache performance statistics.
+#[pyclass(name = "CacheStats")]
+#[derive(Clone)]
+pub struct PyCacheStats {
+    #[pyo3(get)]
+    pub hits: u64,
+    #[pyo3(get)]
+    pub misses: u64,
+    #[pyo3(get)]
+    pub entries: usize,
+    #[pyo3(get)]
+    pub capacity: usize,
+    #[pyo3(get)]
+    pub hit_rate: f64,
+}
+
+#[pymethods]
+impl PyCacheStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "CacheStats(hits={}, misses={}, entries={}/{}, hit_rate={:.1}%)",
+            self.hits,
+            self.misses,
+            self.entries,
+            self.capacity,
+            self.hit_rate * 100.0
+        )
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("hits", self.hits)?;
+        d.set_item("misses", self.misses)?;
+        d.set_item("entries", self.entries)?;
+        d.set_item("capacity", self.capacity)?;
+        d.set_item("hit_rate", self.hit_rate)?;
+        Ok(d)
+    }
+}
+
+impl From<cache::CacheStats> for PyCacheStats {
+    fn from(s: cache::CacheStats) -> Self {
+        Self {
+            hits: s.hits,
+            misses: s.misses,
+            entries: s.entries,
+            capacity: s.capacity,
+            hit_rate: s.hit_rate(),
         }
     }
 }
@@ -801,6 +856,7 @@ impl PyTextRankConfig {
 pub struct PyBaseTextRank {
     config: TextRankConfig,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -825,6 +881,7 @@ impl PyBaseTextRank {
         Ok(Self {
             config: inner_config,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
@@ -835,6 +892,11 @@ impl PyBaseTextRank {
     /// with pre-tokenized data from spaCy.
     #[pyo3(signature = (text))]
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text(text);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let text = text.to_owned();
         let pool = self.thread_pool.clone();
@@ -858,7 +920,9 @@ impl PyBaseTextRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     /// Get the number of threads in the dedicated pool, or None if using the global pool.
@@ -874,10 +938,37 @@ impl PyBaseTextRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "BaseTextRank(top_n={}, language='{}')",
-            self.config.top_n, self.config.language
+            "BaseTextRank(top_n={}, language='{}', cache={})",
+            self.config.top_n,
+            self.config.language,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -887,6 +978,7 @@ impl PyBaseTextRank {
 pub struct PyPositionRank {
     config: TextRankConfig,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -911,12 +1003,18 @@ impl PyPositionRank {
         Ok(Self {
             config: inner_config,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
     /// Extract keywords using PositionRank
     #[pyo3(signature = (text))]
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text(text);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let text = text.to_owned();
         let pool = self.thread_pool.clone();
@@ -939,7 +1037,9 @@ impl PyPositionRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -953,10 +1053,37 @@ impl PyPositionRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "PositionRank(top_n={}, language='{}')",
-            self.config.top_n, self.config.language
+            "PositionRank(top_n={}, language='{}', cache={})",
+            self.config.top_n,
+            self.config.language,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -968,6 +1095,7 @@ pub struct PyBiasedTextRank {
     focus_terms: Vec<String>,
     bias_weight: f64,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -996,6 +1124,7 @@ impl PyBiasedTextRank {
             focus_terms: focus_terms.unwrap_or_default(),
             bias_weight,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
@@ -1015,6 +1144,12 @@ impl PyBiasedTextRank {
         // Update focus terms if provided
         if let Some(terms) = focus_terms {
             self.focus_terms = terms;
+        }
+
+        // Cache key includes focus terms since they affect the result.
+        let key = cache::hash_text_with_params(text, &self.focus_terms);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
         }
 
         let config = self.config.clone();
@@ -1045,7 +1180,9 @@ impl PyBiasedTextRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1059,10 +1196,38 @@ impl PyBiasedTextRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "BiasedTextRank(focus_terms={:?}, bias_weight={}, top_n={})",
-            self.focus_terms, self.bias_weight, self.config.top_n
+            "BiasedTextRank(focus_terms={:?}, bias_weight={}, top_n={}, cache={})",
+            self.focus_terms,
+            self.bias_weight,
+            self.config.top_n,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -1075,6 +1240,7 @@ impl PyBiasedTextRank {
 pub struct PySingleRank {
     config: TextRankConfig,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -1099,12 +1265,18 @@ impl PySingleRank {
         Ok(Self {
             config: inner_config,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
     /// Extract keywords using SingleRank
     #[pyo3(signature = (text))]
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text(text);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let text = text.to_owned();
         let pool = self.thread_pool.clone();
@@ -1127,7 +1299,9 @@ impl PySingleRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1141,10 +1315,37 @@ impl PySingleRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "SingleRank(top_n={}, language='{}')",
-            self.config.top_n, self.config.language
+            "SingleRank(top_n={}, language='{}', cache={})",
+            self.config.top_n,
+            self.config.language,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -1160,6 +1361,23 @@ pub struct PyTopicalPageRank {
     topic_weights: HashMap<String, f64>,
     min_weight: f64,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
+}
+
+/// Build a deterministic hash key for topic weights (HashMap iteration
+/// order is non-deterministic, so we sort the keys first).
+fn hash_topic_weights(text: &str, weights: &HashMap<String, f64>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let mut sorted: Vec<_> = weights.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in sorted {
+        k.hash(&mut hasher);
+        v.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[pymethods]
@@ -1188,6 +1406,7 @@ impl PyTopicalPageRank {
             topic_weights: topic_weights.unwrap_or_default(),
             min_weight,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
@@ -1206,6 +1425,11 @@ impl PyTopicalPageRank {
     ) -> PyResult<PyTextRankResult> {
         if let Some(weights) = topic_weights {
             self.topic_weights = weights;
+        }
+
+        let key = hash_topic_weights(text, &self.topic_weights);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
         }
 
         let config = self.config.clone();
@@ -1235,7 +1459,9 @@ impl PyTopicalPageRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1249,12 +1475,38 @@ impl PyTopicalPageRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "TopicalPageRank(topic_weights={}, min_weight={}, top_n={})",
+            "TopicalPageRank(topic_weights={}, min_weight={}, top_n={}, cache={})",
             self.topic_weights.len(),
             self.min_weight,
-            self.config.top_n
+            self.config.top_n,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -1268,6 +1520,7 @@ pub struct PyAutoRank {
     semantic_weights: HashMap<String, f64>,
     semantic_min_weight: f64,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -1300,6 +1553,7 @@ impl PyAutoRank {
             semantic_weights: semantic_weights.unwrap_or_default(),
             semantic_min_weight,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
@@ -1313,6 +1567,11 @@ impl PyAutoRank {
 
     #[pyo3(signature = (text))]
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text_with_params(text, &self.focus_terms);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let focus_terms = self.focus_terms.clone();
         let bias_weight = self.bias_weight;
@@ -1350,7 +1609,9 @@ impl PyAutoRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1364,12 +1625,38 @@ impl PyAutoRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "AutoRank(focus_terms={}, semantic_weights={}, top_n={})",
+            "AutoRank(focus_terms={}, semantic_weights={}, top_n={}, cache={})",
             self.focus_terms.len(),
             self.semantic_weights.len(),
-            self.config.top_n
+            self.config.top_n,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -1385,6 +1672,7 @@ pub struct PyMultipartiteRank {
     similarity_threshold: f64,
     alpha: f64,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[pymethods]
@@ -1413,12 +1701,18 @@ impl PyMultipartiteRank {
             similarity_threshold,
             alpha,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
     /// Extract keywords using MultipartiteRank
     #[pyo3(signature = (text))]
     fn extract_keywords(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text(text);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let text = text.to_owned();
         let similarity_threshold = self.similarity_threshold;
@@ -1446,7 +1740,9 @@ impl PyMultipartiteRank {
             })
         });
 
-        Ok(extraction_result_to_py(result))
+        let py_result = extraction_result_to_py(result);
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1460,10 +1756,38 @@ impl PyMultipartiteRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "MultipartiteRank(alpha={}, similarity_threshold={}, top_n={})",
-            self.alpha, self.similarity_threshold, self.config.top_n
+            "MultipartiteRank(alpha={}, similarity_threshold={}, top_n={}, cache={})",
+            self.alpha,
+            self.similarity_threshold,
+            self.config.top_n,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -1478,6 +1802,7 @@ pub struct PySentenceRank {
     config: TextRankConfig,
     sort_by_position: bool,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    cache: Arc<ExtractionCache<PyTextRankResult>>,
 }
 
 #[cfg(feature = "sentence-rank")]
@@ -1505,12 +1830,18 @@ impl PySentenceRank {
             config: inner_config,
             sort_by_position,
             thread_pool: build_thread_pool(max_threads)?,
+            cache: Arc::new(ExtractionCache::disabled()),
         })
     }
 
     /// Extract the most important sentences from text
     #[pyo3(signature = (text))]
     fn extract_sentences(&self, py: Python<'_>, text: &str) -> PyResult<PyTextRankResult> {
+        let key = cache::hash_text(text);
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached);
+        }
+
         let config = self.config.clone();
         let text = text.to_owned();
         let sort_by_position = self.sort_by_position;
@@ -1541,13 +1872,15 @@ impl PySentenceRank {
             })
         });
 
-        Ok(PyTextRankResult {
+        let py_result = PyTextRankResult {
             phrases: result.phrases.into_iter().map(PyPhrase::from).collect(),
             converged: result.converged,
             iterations: result.iterations as usize,
             debug: result.debug.map(convert_debug_payload),
             consensus: None,
-        })
+        };
+        self.cache.insert(key, py_result.clone());
+        Ok(py_result)
     }
 
     #[getter]
@@ -1561,10 +1894,38 @@ impl PySentenceRank {
         Ok(())
     }
 
+    /// Enable the result cache with the given capacity (default 128).
+    #[pyo3(signature = (capacity=128))]
+    fn enable_cache(&self, capacity: usize) {
+        self.cache.enable(capacity);
+    }
+
+    /// Disable the result cache and free all cached entries.
+    fn disable_cache(&self) {
+        self.cache.disable();
+    }
+
+    /// Clear all cached entries and reset statistics.
+    fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Return cache performance statistics, or None if caching is disabled.
+    fn cache_stats(&self) -> Option<PyCacheStats> {
+        self.cache.stats().map(PyCacheStats::from)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "SentenceRank(top_n={}, sort_by_position={}, language='{}')",
-            self.config.top_n, self.sort_by_position, self.config.language
+            "SentenceRank(top_n={}, sort_by_position={}, language='{}', cache={})",
+            self.config.top_n,
+            self.sort_by_position,
+            self.config.language,
+            if self.cache.is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }

@@ -12,6 +12,7 @@
 //! - **Flexible**: Multiple algorithm variants and configuration options
 //! - **Python bindings**: Seamless integration with Python via PyO3
 
+pub mod cache;
 pub mod clustering;
 pub mod errors;
 pub mod graph;
@@ -25,6 +26,9 @@ pub mod variants;
 
 #[cfg(feature = "python")]
 pub mod python;
+
+// Re-export cache types
+pub use cache::{CacheStats, ExtractionCache};
 
 // Re-export commonly used types
 pub use errors::{Result, TextRankError};

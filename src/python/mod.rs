@@ -20,6 +20,9 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<native::PyVariantRun>()?;
     m.add_class::<native::PyPhraseSupport>()?;
 
+    // Cache stats
+    m.add_class::<native::PyCacheStats>()?;
+
     // Debug / inspect classes
     m.add_class::<native::PyDebugPayload>()?;
     m.add_class::<native::PyGraphStats>()?;
