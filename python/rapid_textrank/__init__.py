@@ -35,6 +35,7 @@ from rapid_textrank._rust import (
     DroppedCandidate,
     ClusterMember,
     ClusterDetail,
+    CacheStats,
 )
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "DroppedCandidate",
     "ClusterMember",
     "ClusterDetail",
+    "CacheStats",
     "topic_weights_from_lda",
 ]
 
